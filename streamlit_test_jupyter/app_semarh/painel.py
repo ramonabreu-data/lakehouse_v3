@@ -50,23 +50,29 @@ def render(user: dict | None) -> None:
         st.info("Nenhum BI disponível para esta área ainda.")
         return
 
+    # --- BIs como abas (segmented_control), persistidas na URL (?bi=...) ---
     por_bi = {b["slug"]: b for b in bis}
+    slugs = [b["slug"] for b in bis]
     bi_atual = qp.get("bi")
+    if bi_atual not in por_bi:
+        bi_atual = slugs[0]
 
-    if bi_atual in por_bi:
-        # --- BI aberto ---
-        if st.button("← Voltar aos BIs", key="voltar_bi"):
-            del st.query_params["bi"]
-            st.rerun()
-        st.divider()
-        por_bi[bi_atual]["render"](user)
-    else:
-        # --- lista de BIs do setor ---
-        st.caption("Selecione um BI para abrir:")
-        colunas = st.columns(min(3, len(bis)))
-        for i, b in enumerate(bis):
-            if colunas[i % len(colunas)].button(
-                f"📊 {b['titulo']}", key=f"bi_{b['slug']}", use_container_width=True
-            ):
-                st.query_params["bi"] = b["slug"]
-                st.rerun()
+    # key por setor para nao carregar selecao de um setor para outro
+    bi_key = f"bi_sel_{setor['slug']}"
+
+    def _sincronizar_bi():
+        escolha = st.session_state.get(bi_key)
+        if escolha:
+            st.query_params["bi"] = escolha
+
+    escolhido = st.segmented_control(
+        "BI",
+        slugs,
+        format_func=lambda s: por_bi[s]["titulo"],
+        default=bi_atual,
+        key=bi_key,
+        on_change=_sincronizar_bi,
+        label_visibility="collapsed",
+    )
+    st.divider()
+    por_bi[escolhido or bi_atual]["render"](user)

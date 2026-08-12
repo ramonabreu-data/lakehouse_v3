@@ -42,6 +42,15 @@ section[data-testid="stSidebar"] .stButton > button {
     margin-bottom: .15rem;
 }
 
+/* ---- BIs como abas (segmented_control): compactas e quebram na tela ---- */
+[data-testid="stSegmentedControl"] { flex-wrap: wrap; gap: .3rem; }
+[data-testid="stSegmentedControl"] button {
+    padding: .28rem .72rem;
+    font-size: clamp(.72rem, 1.9vw, .86rem);
+    border-radius: 10px;
+    min-height: 0;
+}
+
 /* ---- formularios (login/cadastro) compactos ---- */
 [data-testid="stForm"] {
     max-width: 400px;
