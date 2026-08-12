@@ -19,16 +19,17 @@ precisa ser editado para atender um novo cliente.
 2. [Requisitos](#requisitos)
 3. [Implantar em um novo projeto](#implantar-em-um-novo-projeto)
 4. [Passo a passo](#passo-a-passo)
-5. [Notebooks-modelo](#notebooks-modelo)
-6. [Imagem do Spark/Jupyter](#imagem-do-sparkjupyter)
-7. [Zonas do object store](#zonas-do-object-store)
-8. [Portas e endereços](#portas-e-endereços)
-9. [Matriz de versões](#matriz-de-versões)
-10. [Armadilhas conhecidas](#armadilhas-conhecidas)
-11. [Decisões do compose](#decisões-do-compose)
-12. [Solução de problemas](#solução-de-problemas)
-13. [Segurança](#segurança)
-14. [Estrutura do repositório](#estrutura-do-repositório)
+5. [Autenticação do dashboard](#autenticação-do-dashboard)
+6. [Notebooks-modelo](#notebooks-modelo)
+7. [Imagem do Spark/Jupyter](#imagem-do-sparkjupyter)
+8. [Zonas do object store](#zonas-do-object-store)
+9. [Portas e endereços](#portas-e-endereços)
+10. [Matriz de versões](#matriz-de-versões)
+11. [Armadilhas conhecidas](#armadilhas-conhecidas)
+12. [Decisões do compose](#decisões-do-compose)
+13. [Solução de problemas](#solução-de-problemas)
+14. [Segurança](#segurança)
+15. [Estrutura do repositório](#estrutura-do-repositório)
 
 ---
 
@@ -50,6 +51,11 @@ flowchart LR
     DRE[Dremio<br/>SQL federado + reflections]
     STL[Streamlit<br/>dashboard]
 
+    subgraph Auth
+        GT[Supabase GoTrue<br/>login + sessão]
+        SDB[(Postgres<br/>usuários)]
+    end
+
     SPK -->|dados Parquet/Iceberg| MIO
     SPK -->|metadados de tabela| NES
     NES -.->|aponta para| MIO
@@ -58,6 +64,8 @@ flowchart LR
     DRE --> PG
     DRE --> MG
     STL -->|Arrow Flight :32010| DRE
+    STL -->|login / admin :9999| GT
+    GT --> SDB
 ```
 
 Os serviços ficam numa rede Docker chamada `interna` (que o Compose publica como
@@ -193,6 +201,7 @@ curl -sf http://localhost:9000/minio/health/live  && echo "MinIO   OK"
 curl -sf http://localhost:19120/api/v2/config     && echo "Nessie  OK"
 curl -sf -o /dev/null http://localhost:9047       && echo "Dremio  OK"
 curl -sf -o /dev/null http://localhost:8080       && echo "Spark   OK"
+curl -sf http://localhost:9999/health             && echo "GoTrue  OK"
 ```
 
 O Dremio leva **1 a 3 minutos** no primeiro boot. Acompanhe com `docker compose logs -f dremio`.
@@ -378,28 +387,48 @@ spark.sql("USE REFERENCE experimento IN nessie")
 
 ### Passo 10 — Streamlit
 
-Preencha `streamlit_test_jupyter/vars.env` com o admin do passo 5:
+Copie o template e preencha `streamlit_test_jupyter/vars.env`. Ele tem três blocos: a conta de
+serviço do Dremio (do passo 5, usada para **consultar** o lakehouse), a configuração do Supabase
+(login) e o cookie de sessão. Detalhes em [Autenticação do dashboard](#autenticação-do-dashboard).
+
+```bash
+cp streamlit_test_jupyter/vars.env.example streamlit_test_jupyter/vars.env
+# gere os segredos:
+python3 -c "import secrets; print(secrets.token_urlsafe(48))"   # COOKIE_SECRET
+```
 
 ```ini
+# Dremio (conta de serviço que consulta o lakehouse)
 DREMIO_USERNAME=seu_usuario
 DREMIO_PASSWORD=sua_senha
 DREMIO_ENDPOINT=dremio:9047
 DREMIO_FLIGHT_ENDPOINT=dremio:32010
+# Supabase (login) — SUPABASE_URL usa o nome de serviço na rede Docker.
+AUTH_ENABLED=true
+SUPABASE_URL=http://supabase-auth:9999
+JWT_SECRET=<IDÊNTICO ao JWT_SECRET do .env da stack>
+AUTH_MASTER_EMAIL=master@seu-dominio.local
+AUTH_MASTER_PASSWORD=<senha forte do master>
+COOKIE_SECRET=<32+ caracteres>
 ```
 
-Os endpoints usam nomes de serviço porque o app roda **dentro** da rede Docker. Ajuste a query em
-`app.py` para um dataset que exista no seu Dremio e rode:
+Os endpoints usam nomes de serviço porque o app roda **dentro** da rede Docker. Os serviços de
+autenticação (`supabase-db`, `supabase-auth`) já sobem com o `docker compose up -d` do passo 2.
+Ajuste a query em `app.py` para um dataset que exista no seu Dremio e rode:
 
 ```bash
 docker compose exec -w /workspace/streamlit spark \
   streamlit run app.py --server.port 8501 --server.address 0.0.0.0
 ```
 
-Acesse <http://localhost:8502>.
+Acesse <http://localhost:8502> e entre com o usuário **master** (criado no primeiro boot a partir do
+`vars.env`). Pela barra lateral → **Administrar usuarios**, crie as contas de quem vai visualizar.
 
 > A porta 8501 é a de **dentro** do container; no host ela sai em **8502**. A pasta chega ao
 > container pelo volume `./streamlit_test_jupyter:/workspace/streamlit`, e o `streamlit` já vem
 > instalado pelo entrypoint.
+>
+> Para desligar o login em desenvolvimento, use `AUTH_ENABLED=false` no `vars.env`.
 
 ### Passo 11 — Parar e limpar
 
@@ -408,6 +437,73 @@ docker compose stop      # pausa, mantém tudo
 docker compose down      # remove containers, MANTÉM os volumes nomeados
 docker compose down -v   # apaga TAMBÉM os dados de todos os serviços
 ```
+
+---
+
+## Autenticação do dashboard
+
+O dashboard fica atrás de um login. A autenticação usa **Supabase GoTrue** (a API de auth do
+Supabase) com um Postgres dedicado — dois serviços que já vêm no `docker-compose.yml`
+(`supabase-db` e `supabase-auth`). O Streamlit continua consultando o Dremio com a conta de serviço
+do `vars.env`; o Supabase só decide **quem** entra no painel. Não subimos o Supabase Studio (a UI
+visual) — o gerenciamento de usuários é feito pelo painel do master, dentro do próprio app.
+
+### Modelo de usuários: master + visualizadores
+
+- Cadastro público **desligado** (`SUPABASE_DISABLE_SIGNUP=true`): ninguém se registra sozinho.
+- Um **usuário master** (`AUTH_MASTER_EMAIL`) é criado no primeiro boot do app, a partir do
+  `vars.env`. Se não existir, é recriado a partir dessas variáveis.
+- Só o master cria/remove usuários, pelo painel **"Administrar usuarios"** na barra lateral. Por
+  baixo, ele chama a Admin API do GoTrue (`/admin/users`) com um token `service_role` assinado
+  localmente com o `JWT_SECRET` (nunca vai ao navegador).
+- Os demais usuários apenas visualizam a aplicação.
+
+### Configuração (duas metades, de propósito)
+
+| Onde | Variáveis | Papel |
+|---|---|---|
+| `.env` da stack | `JWT_SECRET`, `SUPABASE_DB_PASSWORD`, `SUPABASE_DISABLE_SIGNUP`, `SUPABASE_MAILER_AUTOCONFIRM`, `SUPABASE_AUTH_PORT` | Infra do GoTrue (compose) |
+| `streamlit_test_jupyter/vars.env` | `SUPABASE_URL`, `AUTH_ENABLED`, `COOKIE_SECRET`, `AUTH_MASTER_EMAIL/PASSWORD`, `JWT_SECRET` | Cliente do app |
+
+O `JWT_SECRET` aparece nos **dois** arquivos e precisa ser **idêntico**: o GoTrue assina os tokens
+com ele, e o app o usa para assinar o token de admin do painel do master. Gere os segredos com
+`python3 -c "import secrets; print(secrets.token_urlsafe(48))"`.
+
+### Sessão e cookie
+
+Depois do login, a sessão (tokens do GoTrue) é guardada num **cookie criptografado** no navegador —
+a chave de cifra fica no servidor (`COOKIE_SECRET`), o componente só enxerga o texto cifrado. O
+`access_token` é renovado pelo `refresh_token` perto de expirar; ao sair, o cookie é apagado e a
+tela de login volta. `AUTH_ENABLED=false` pula tudo isso (modo dev) e consulta direto com a conta de
+serviço.
+
+### Sem servidor de e-mail
+
+`SUPABASE_MAILER_AUTOCONFIRM=true` porque não há SMTP local: as contas criadas pelo master já entram
+sem confirmar e-mail. Para produção com e-mail real, configure as variáveis `GOTRUE_SMTP_*` e ponha
+o autoconfirm em `false`.
+
+### Módulo `auth/`
+
+`streamlit_test_jupyter/auth/`: `supabase_client.py` (cliente GoTrue + Admin API), `session.py`
+(normaliza, renova e valida a sessão), `cookies.py` (cookie criptografado) e `authentication.py`
+(`require_auth()`, telas de login e o painel do master).
+
+### Armadilhas
+
+- **`supabase-init.sql` não pode pré-criar `auth.factor_type`.** A migração de MFA do GoTrue cria
+  três tipos (`factor_type`, `factor_status`, `aal_level`) num único bloco
+  `DO ... EXCEPTION WHEN duplicate_object`; se `factor_type` já existe, o bloco cai no `EXCEPTION` e
+  **pula** os outros dois — a tabela seguinte quebra com `type "factor_status" does not exist` e o
+  GoTrue fica `unhealthy` num loop. O init só cria o schema `auth`, o `search_path` e o role
+  `postgres`. Se cair nisso, corrija o init e **recrie o volume** (o init só roda em volume novo):
+  `docker compose rm -sf supabase-auth supabase-db && docker volume rm <PROJETO>_supabase-auth-data`.
+- **`streamlit-cookies-manager` 0.2.0 × Streamlit ≥ 1.36.** A lib (sem manutenção) reusa a mesma
+  key de componente no `save()`; o Streamlit ≥ 1.36 proíbe key repetida no mesmo run e derruba o app
+  (aparecia no logout, com `StreamlitDuplicateElementKey`). O `cookies.py` aplica dois monkeypatches
+  (key única por run + troca do `st.cache` legado por `st.cache_resource`). A lib está fixada no
+  `docker/spark/requirements.txt`; depois de recriar o container `spark`, rode
+  `docker compose build spark`.
 
 ---
 
@@ -646,11 +742,16 @@ CREATE TABLE nessie.coleta.funcionarios (id INT, nome VARCHAR, salario DOUBLE);
 | Spark History | 18080 | histórico de jobs |
 | JupyterLab | **8889** | notebooks (sem token) — mapeada da 8888 interna |
 | Streamlit | **8502** | dashboard — mapeada da 8501 interna |
+| Supabase GoTrue | 9999 | API de autenticação do dashboard |
 | MinIO | 9000 | API S3 |
 | MinIO | 9001 | console web |
 | Nessie | 19120 | API REST (`/api/v2`) |
 | PostgreSQL | 5435 | mapeada da 5432 interna |
 | MongoDB | 27017 | — |
+
+O Postgres do Supabase (`supabase-db`) **não** publica porta no host: é acessado só de dentro da
+rede pelo GoTrue. Para inspecionar usuários, use o painel do master ou
+`docker compose exec supabase-db psql -U supabase_auth_admin -d supabase_auth`.
 
 Jupyter e Streamlit são publicados em 8889/8502 porque 8888 e 8501 costumam já estar ocupadas.
 Dentro da rede Docker eles continuam em 8888/8501 — o remapeamento é só na publicação.
@@ -811,7 +912,7 @@ Ambiente de referência: Docker 29.6.1, Compose v5.3.0, kernel Linux 7.0, x86_64
 
 | Verificação | Resultado |
 |---|---|
-| 6 serviços `running`; MinIO e Postgres `healthy` | ✅ |
+| 8 serviços `running`; MinIO, Postgres, `supabase-db` e `supabase-auth` `healthy` | ✅ |
 | MinIO: 3 zonas criadas a partir do `.env`, seed copiado, objetos sobrevivem a `down` + `up` | ✅ |
 | Nessie 0.108.4: `/api/v2/config` com `maxSupportedApiVersion: 2`; repositório sobrevive a restart | ✅ |
 | Postgres 17: seed `001_init.sql` aplicado | ✅ |
@@ -825,7 +926,9 @@ Ambiente de referência: Docker 29.6.1, Compose v5.3.0, kernel Linux 7.0, x86_64
 | **Spark lê tabela criada pelo Dremio, e Dremio lê tabela criada pelo Spark** | ✅ |
 | Dremio: join federado Postgres × MongoDB | ✅ |
 | Dremio: join entre tabela Iceberg e Postgres | ✅ |
-| Streamlit: login + Arrow Flight (`:32010`) + query federada | ✅ |
+| GoTrue: 54 migrações aplicadas; `/health` OK; master criado no 1º boot | ✅ |
+| Streamlit: login Supabase + sessão em cookie + Arrow Flight (`:32010`) + query federada | ✅ |
+| Auth: signup público bloqueado; master cria/remove visualizador; visualizador entra sem ser admin | ✅ |
 | Notebooks-modelo executados de ponta a ponta (`nbconvert --execute`) | ✅ |
 | Pipeline completo: PostgreSQL/CSV/JSON → `coleta` → `limpeza` → `refinamento` → Streamlit | ✅ |
 | MySQL via JDBC no Spark (contra servidor externo de teste) | ✅ |
@@ -856,6 +959,10 @@ Ambiente de referência: Docker 29.6.1, Compose v5.3.0, kernel Linux 7.0, x86_64
 | Jupyter pede token que ninguém tem | `--NotebookApp.token` não vale no JupyterLab 4 | use `--ServerApp.token='' --ServerApp.password=''` |
 | Flags do entrypoint ignoradas sem erro | YAML `>` preservou a quebra de linha | comando em uma linha só (ver [armadilha 1](#armadilha-1-a-folded-scalar-do-yaml)) |
 | Streamlit: "No such file app.py" | pasta não montada | volume `./streamlit_test_jupyter:/workspace/streamlit` |
+| GoTrue `unhealthy` citando `type "factor_status" does not exist` | `supabase-init.sql` pré-criou `auth.factor_type` | remova essa criação do init e recrie o volume `<PROJETO>_supabase-auth-data` (ver [Autenticação](#autenticação-do-dashboard)) |
+| Login quebra com `StreamlitDuplicateElementKey` / botão "Sair" não funciona | `streamlit-cookies-manager` × Streamlit ≥ 1.36 | garanta o `auth/cookies.py` com os monkeypatches; a lib está no `requirements.txt` |
+| Painel do master não cria usuário | `JWT_SECRET` do `vars.env` ≠ do `.env`, ou signup fechado sem admin role | iguale os `JWT_SECRET` e confira `GOTRUE_JWT_ADMIN_ROLES=service_role` |
+| Login sempre "inválido" recém-criado | `SUPABASE_MAILER_AUTOCONFIRM=false` sem SMTP | ponha `true` em dev, ou configure `GOTRUE_SMTP_*` |
 | `Conflict. The container name is already in use` | outro projeto usa o mesmo nome | troque `PROJETO` no `.env`; confira com `docker ps -a` |
 | Editei o seed e nada mudou | `initdb.d` só roda com volume vazio | `docker compose down -v`, ou remova só aquele volume |
 | Perdi tudo após `down` | usou `-v` | `docker compose stop`, ou `down` sem `-v` |
@@ -882,7 +989,11 @@ Esta stack é **para desenvolvimento local**. Antes de expor qualquer porta fora
 - Use access keys de serviço no MinIO (passo 4) em vez da credencial root, com política restrita por
   zona.
 - Nenhuma senha deve ficar no `docker-compose.yml` nem em arquivo versionado. `.env` e
-  `streamlit_test_jupyter/vars.env` estão no `.gitignore` — mantenha assim.
+  `streamlit_test_jupyter/vars.env` estão no `.gitignore` — mantenha assim. Versione apenas os
+  templates `.env.example` e `vars.env.example`, sempre com valores de placeholder.
+- O dashboard exige login (Supabase GoTrue). Trate o `JWT_SECRET` como segredo: ele assina os tokens
+  de sessão **e** o token de admin do painel do master; mantenha-o idêntico entre `.env` e
+  `vars.env` e nunca o versione. Troque a senha do master (`AUTH_MASTER_PASSWORD`) antes de expor.
 - Se alguma credencial já foi versionada e enviada a um remoto, considere-a comprometida: trocar o
   arquivo não apaga o histórico do git.
 
@@ -893,12 +1004,15 @@ Esta stack é **para desenvolvimento local**. Antes de expor qualquer porta fora
 ```
 dremio-spark-minio/
 ├── docker-compose.yml                # genérico; parametrizado pelo .env
-├── .env                              # PROJETO, zonas e senhas — NÃO versionar
+├── .env                              # PROJETO, zonas, senhas e Supabase — NÃO versionar
+├── .env.example                      # template versionável do .env
 ├── .gitignore
 ├── readme.md
-├── docker/spark/                     # imagem propria do Spark/Jupyter
-│   ├── Dockerfile
-│   └── requirements.txt              # libs de ciência de dados e ML
+├── docker/
+│   ├── spark/                        # imagem propria do Spark/Jupyter
+│   │   ├── Dockerfile
+│   │   └── requirements.txt          # libs de DS/ML + streamlit-cookies-manager
+│   └── supabase-init.sql             # schema `auth` do GoTrue (1º boot do supabase-db)
 ├── notebooks/                        # modelos, montados em /workspace/notebooks
 │   ├── lakehouse.py                  # módulo comum: sessão, leitura, escrita
 │   ├── 00_ambiente.ipynb
@@ -916,6 +1030,12 @@ dremio-spark-minio/
 │   └── postgres/         # 001_init.sql — roda no primeiro boot do Postgres
 └── streamlit_test_jupyter/
     ├── app.py            # dashboard Streamlit via Arrow Flight
+    ├── auth/             # autenticação Supabase do dashboard
+    │   ├── authentication.py   # require_auth(): login, sessão, painel do master
+    │   ├── supabase_client.py  # cliente GoTrue + Admin API
+    │   ├── session.py          # normaliza, renova e valida a sessão
+    │   └── cookies.py          # cookie de sessão criptografado
     ├── run.ipynb
-    └── vars.env          # credenciais do Dremio — NÃO versionar
+    ├── vars.env         # Dremio + Supabase + master — NÃO versionar
+    └── vars.env.example # template versionável do vars.env
 ```
