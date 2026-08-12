@@ -54,6 +54,12 @@ flowchart LR
         SDB[(Postgres<br/>usuários)]
     end
 
+    USR([Navegador]) -->|HTTPS 443| CAD[Caddy<br/>reverse proxy + TLS]
+    CAD -.->|dashboard.| STL
+    CAD -.->|dremio.| DRE
+    CAD -.->|minio.| MIO
+    CAD -.->|jupyter.| SPK
+
     SPK -->|dados Parquet/Iceberg| MIO
     SPK -->|metadados de tabela| NES
     NES -.->|aponta para| MIO
@@ -62,15 +68,15 @@ flowchart LR
     DRE --> PG
     DRE --> MG
     STL -->|Arrow Flight :32010| DRE
-    STL -->|login / admin :9999| GT
+    STL -->|login / admin| GT
     GT --> SDB
 ```
 
 Os serviços ficam numa rede Docker chamada `interna` (que o Compose publica como
 `${PROJETO}_interna`). **Dentro** dessa rede eles se enxergam pelo nome do serviço —
-`minio:9000`, `nessie:19120`, `dremio:9047`. **Do navegador ou do host**, use
-`localhost:<porta publicada>`. Confundir os dois é a causa mais comum de erro de conexão aqui: um
-endpoint com `localhost` dentro de uma configuração do Dremio nunca vai funcionar.
+`minio:9000`, `nessie:19120`, `dremio:9047`, `supabase-auth:9999`. **De fora**, o único ponto de
+entrada na rede é o **proxy Caddy** (443), que serve as interfaces web por subdomínio e com TLS; os
+demais serviços só publicam em `127.0.0.1`. Ver [Portas e endereços](#portas-e-endereços).
 
 ---
 
@@ -197,9 +203,10 @@ docker compose up -d dremio spark
 ```bash
 curl -sf http://localhost:9000/minio/health/live  && echo "MinIO   OK"
 curl -sf http://localhost:19120/api/v2/config     && echo "Nessie  OK"
-curl -sf -o /dev/null http://localhost:9047       && echo "Dremio  OK"
+curl -skf -o /dev/null https://dremio.localhost    && echo "Dremio  OK (via proxy)"
 curl -sf -o /dev/null http://localhost:8080       && echo "Spark   OK"
-curl -sf http://localhost:9999/health             && echo "GoTrue  OK"
+curl -sf  http://localhost:9999/health             && echo "GoTrue  OK"
+curl -skf -o /dev/null https://dashboard.localhost  && echo "Proxy   OK"
 ```
 
 O Dremio leva **1 a 3 minutos** no primeiro boot. Acompanhe com `docker compose logs -f dremio`.
@@ -209,7 +216,7 @@ Nessie com API v2 (versão ≥ 0.59.0).
 
 ### Passo 4 — MinIO: zonas e credencial de aplicação
 
-Console web: <http://localhost:9001>, com as credenciais do `.env`.
+Console web: <https://minio.localhost>, com as credenciais do `.env`.
 
 As três zonas são criadas pelo entrypoint no primeiro boot. Para conferir ou recriar à mão:
 
@@ -236,7 +243,7 @@ Guarde o `Access Key` e o `Secret Key` — são usados nos passos 6, 7 e 9.
 
 ### Passo 5 — Dremio: criar o usuário administrador
 
-Abra <http://localhost:9047>. No primeiro acesso o Dremio pede para criar o admin. As credenciais vão
+Abra <https://dremio.localhost>. No primeiro acesso o Dremio pede para criar o admin. As credenciais vão
 para `streamlit_test_jupyter/vars.env` no passo 10.
 
 ### Passo 6 — Dremio: MinIO como fonte S3
@@ -299,7 +306,7 @@ Em **Advanced Options**, as mesmas três propriedades do passo 6.
 
 ### Passo 9 — Spark + Jupyter: gravar uma tabela Iceberg
 
-Abra o JupyterLab em <http://localhost:8889/?token=SEU_TOKEN> (o `JUPYTER_TOKEN` do `.env`). Os modelos prontos estão em
+Abra o JupyterLab em <https://jupyter.localhost/?token=SEU_TOKEN> (o `JUPYTER_TOKEN` do `.env`). Os modelos prontos estão em
 `notebooks/` — comece por `00_ambiente.ipynb` e veja [Notebooks-modelo](#notebooks-modelo). O código
 abaixo é o mesmo que o `lakehouse.py` encapsula, mostrado por extenso para referência.
 
@@ -419,7 +426,7 @@ docker compose exec -w /workspace/streamlit spark \
   streamlit run app.py --server.port 8501 --server.address 0.0.0.0
 ```
 
-Acesse <http://localhost:8502> e entre com o usuário **master** (criado no primeiro boot a partir do
+Acesse <https://dashboard.localhost> e entre com o usuário **master** (criado no primeiro boot a partir do
 `vars.env`). Pela barra lateral → **Administrar usuarios**, crie as contas de quem vai visualizar.
 
 > A porta 8501 é a de **dentro** do container; no host ela sai em **8502**. A pasta chega ao
@@ -736,32 +743,39 @@ CREATE TABLE nessie.coleta.funcionarios (id INT, nome VARCHAR, salario DOUBLE);
 
 ## Portas e endereços
 
-| Serviço | Porta host | Uso |
+**O único serviço publicado na rede é o proxy (Caddy), em 80/443.** As interfaces web saem por ele,
+por subdomínio de `DOMAIN` (padrão `localhost`), com **TLS** (CA interna do Caddy). O HTTP é
+redirecionado para HTTPS.
+
+| Interface | URL (via proxy) | Backend |
 |---|---|---|
-| Dremio | 9047 | UI e API REST |
-| Dremio | 31010 | ODBC/JDBC legado |
-| Dremio | 32010 | **Arrow Flight SQL** (usado pelo Streamlit) |
-| Dremio | 45678 | comunicação interna do cluster |
-| Spark Master | 8080 | Web UI |
-| Spark Master | 7077 | submissão de jobs |
-| Spark Worker | 8081 | Web UI |
-| Spark Jobs | 4040–4045 | UI por aplicação em execução |
-| Spark History | 18080 | histórico de jobs |
-| JupyterLab | **8889** | notebooks (exige `JUPYTER_TOKEN`) — mapeada da 8888 interna |
-| Streamlit | **8502** | dashboard — mapeada da 8501 interna |
-| Supabase GoTrue | 9999 | API de autenticação do dashboard |
-| MinIO | 9000 | API S3 |
-| MinIO | 9001 | console web |
-| Nessie | 19120 | API REST (`/api/v2`) — publicada só em `127.0.0.1` |
-| PostgreSQL | 5435 | mapeada da 5432 interna |
-| MongoDB | 27017 | — |
+| Dashboard (Streamlit) | `https://dashboard.localhost` | spark:8501 |
+| Dremio (UI + REST) | `https://dremio.localhost` | dremio:9047 |
+| MinIO (console) | `https://minio.localhost` | minio:9001 |
+| JupyterLab (exige `JUPYTER_TOKEN`) | `https://jupyter.localhost` | spark:8888 |
 
-O Postgres do Supabase (`supabase-db`) **não** publica porta no host: é acessado só de dentro da
-rede pelo GoTrue. Para inspecionar usuários, use o painel do master ou
-`docker compose exec supabase-db psql -U supabase_auth_admin -d supabase_auth`.
+Os demais serviços **não** são expostos à rede — publicam só em `127.0.0.1` (loopback), para
+depuração local, ou ficam apenas na rede interna do Docker:
 
-Jupyter e Streamlit são publicados em 8889/8502 porque 8888 e 8501 costumam já estar ocupadas.
-Dentro da rede Docker eles continuam em 8888/8501 — o remapeamento é só na publicação.
+| Serviço | Acesso | Uso |
+|---|---|---|
+| Dremio Arrow Flight | `127.0.0.1:32010` | SQL via Flight (usado pelo Streamlit) |
+| Dremio ODBC/JDBC | `127.0.0.1:31010` | conector legado |
+| MinIO API S3 | `127.0.0.1:9000` | clientes S3 |
+| Spark UIs | `127.0.0.1:8080/8081/18080/4040-4045` | Master/Worker/History/jobs |
+| Nessie REST | `127.0.0.1:19120` | `/api/v2` (sem auth — por isso loopback) |
+| Supabase GoTrue | `127.0.0.1:9999` | API de autenticação |
+| PostgreSQL / MongoDB | `127.0.0.1:5435` / `127.0.0.1:27017` | bancos de origem |
+| `supabase-db`, Spark 7077, Dremio 45678 | só rede interna | não publicam no host |
+
+Dentro da rede Docker os serviços se falam pelo nome (`dremio:9047`, `minio:9000`, `nessie:19120`,
+`supabase-auth:9999`) — o proxy e o loopback são só para o acesso a partir do host.
+
+> **Certificado**: como a CA é interna do Caddy, o navegador avisa "não confiável" na primeira vez.
+> Aceite a exceção, ou instale a raiz do Caddy para remover o aviso:
+> `docker compose exec caddy caddy trust` (ou copie `/data/caddy/pki/authorities/local/root.crt`).
+> `*.localhost` resolve para `127.0.0.1`/`::1` em Linux moderno; se o seu não resolver, adicione as
+> linhas ao `/etc/hosts`.
 
 ---
 
@@ -867,7 +881,9 @@ Ambiente de referência: Docker 29.6.1, Compose v5.3.0, kernel Linux 7.0, x86_64
 
 | Verificação | Resultado |
 |---|---|
-| 8 serviços `running`; MinIO, Postgres, `supabase-db` e `supabase-auth` `healthy` | ✅ |
+| 9 serviços `running` (com o proxy Caddy); MinIO, Postgres, `supabase-db` e `supabase-auth` `healthy` | ✅ |
+| Proxy TLS: `https://{dashboard,dremio,minio,jupyter}.localhost` → 200; HTTP → 308 p/ HTTPS | ✅ |
+| Rede externa só vê o proxy (443/80); portas de dados fechadas fora de `127.0.0.1` | ✅ |
 | MinIO: 3 zonas criadas a partir do `.env`, seed copiado, objetos sobrevivem a `down` + `up` | ✅ |
 | Nessie 0.108.4: `/api/v2/config` com `maxSupportedApiVersion: 2`; repositório sobrevive a restart | ✅ |
 | Postgres 17: seed `001_init.sql` aplicado | ✅ |
@@ -896,23 +912,28 @@ Ambiente de referência: Docker 29.6.1, Compose v5.3.0, kernel Linux 7.0, x86_64
 
 ## Segurança
 
-Esta stack é **para desenvolvimento local**. O que já foi endurecido e o que ainda falta antes de
-expor fora da máquina:
+Esta stack é para **desenvolvimento local**, mas já vem endurecida:
 
+- **Só o proxy é exposto à rede.** O Caddy publica 80/443; todo o resto publica apenas em
+  `127.0.0.1` (loopback) ou fica só na rede interna do Docker. Um scan pela rede externa vê somente o
+  proxy. Ver [Portas e endereços](#portas-e-endereços).
+- **TLS em todas as interfaces web.** Dashboard, Dremio, MinIO e Jupyter saem por HTTPS
+  (`https://<sub>.localhost`), com certificado da CA interna do Caddy; o HTTP redireciona para HTTPS.
 - **JupyterLab exige token** (`JUPYTER_TOKEN` no `.env`). Sem ele o serviço nem sobe (o compose usa
-  `${JUPYTER_TOKEN:?...}`). Acesse `http://localhost:8889/?token=<seu-token>`. Isso fecha a execução
-  remota de código que ficava aberta na porta 8889.
-- **Nessie publicado só em loopback** (`127.0.0.1:19120`). Ele não tem autenticação (`NONE`), então
-  não fica exposto à rede — o Dremio e o Spark o alcançam por dentro da rede Docker (`nessie:19120`).
-- **Dashboard com login** (Supabase GoTrue) e **cadastro público desligado**; só o master cria
-  contas. A Admin API (`/admin/users`) só abre com um token `service_role` assinado com o
-  `JWT_SECRET` — validado: sem token → 401, token forjado → 403.
-- **Falta TLS.** MinIO, Dremio e GoTrue trafegam em HTTP. Para uso remoto real, ponha um proxy
-  reverso (nginx/Caddy) com TLS na frente e publique só o proxy.
+  `${JUPYTER_TOKEN:?...}`). Fecha a execução remota de código que ficava aberta.
+- **Nessie sem autenticação (`NONE`)** — por isso não é exposto: publica só em loopback e é acessado
+  pelo Dremio/Spark pela rede interna.
+- **Dashboard com login** (Supabase GoTrue), **cadastro público desligado** (só o master cria
+  contas). A Admin API (`/admin/users`) só abre com token `service_role` assinado com o `JWT_SECRET`
+  — validado: sem token → 401, forjado → 403.
 - O cookie de sessão é **criptografado** (chave no servidor), mas não é `HttpOnly` — limitação da
-  lib `streamlit-cookies-manager`. Como o valor é cifrado, o risco de roubo por XSS é baixo.
+  lib `streamlit-cookies-manager`. Como o valor é cifrado, o risco por XSS é baixo.
 - Use access keys de serviço no MinIO (passo 4) em vez da credencial root, com política restrita por
   zona.
+
+Para expor fora da máquina, ainda: aponte `DOMAIN` para um domínio real e troque a CA interna do
+Caddy por certificados públicos (Let's Encrypt — o Caddy faz automático com um domínio válido); e
+troque a senha do master (`AUTH_MASTER_PASSWORD`).
 - Nenhuma senha deve ficar no `docker-compose.yml` nem em arquivo versionado. `.env` e
   `streamlit_test_jupyter/vars.env` estão no `.gitignore` — mantenha assim. Versione apenas os
   templates `.env.example` e `vars.env.example`, sempre com valores de placeholder.
@@ -937,6 +958,7 @@ dremio-spark-minio/
 │   ├── spark/                        # imagem propria do Spark/Jupyter
 │   │   ├── Dockerfile
 │   │   └── requirements.txt          # libs de DS/ML + streamlit-cookies-manager
+│   ├── caddy/Caddyfile               # reverse proxy TLS (subdomínios + CA interna)
 │   └── supabase-init.sql             # schema `auth` do GoTrue (1º boot do supabase-db)
 ├── notebooks/                        # modelos, montados em /workspace/notebooks
 │   ├── lakehouse.py                  # módulo comum: sessão, leitura, escrita

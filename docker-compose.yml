@@ -13,10 +13,9 @@ services:
     container_name: ${PROJETO}_dremio
     restart: unless-stopped
     ports:
-      - 9047:9047      # UI / REST API
-      - 31010:31010    # ODBC/JDBC legado
-      - 32010:32010    # Arrow Flight SQL
-      - 45678:45678    # interno do cluster
+      # UI/REST (9047) sai pelo proxy: https://dremio.${DOMAIN}. 45678 e interno.
+      - "127.0.0.1:31010:31010"    # ODBC/JDBC legado (so loopback)
+      - "127.0.0.1:32010:32010"    # Arrow Flight SQL (so loopback)
     environment:
       - DREMIO_JAVA_SERVER_EXTRA_OPTS=-Dpaths.dist=file:///opt/dremio/data/dist
       # Ajustado para host com pouca RAM livre. Aumente se sobrar memoria.
@@ -36,13 +35,12 @@ services:
     container_name: ${PROJETO}_spark
     restart: unless-stopped
     ports:
-      - 8080:8080              # Master Web UI
-      - 7077:7077              # submissao de jobs
-      - 8081:8081              # Worker Web UI
-      - 4040-4045:4040-4045    # UI por job
-      - 18080:18080            # History Server
-      - 8889:8888              # JupyterLab (8888 do host pode ja estar em uso)
-      - 8502:8501              # Streamlit  (8501 do host pode ja estar em uso)
+      # Streamlit e Jupyter saem pelo proxy (dashboard./jupyter.${DOMAIN}).
+      # 7077 e so interno (spark://spark:7077). UIs do Spark ficam em loopback.
+      - "127.0.0.1:8080:8080"              # Master Web UI
+      - "127.0.0.1:8081:8081"              # Worker Web UI
+      - "127.0.0.1:4040-4045:4040-4045"    # UI por job
+      - "127.0.0.1:18080:18080"            # History Server
     environment:
       - AWS_REGION=us-east-1
       - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER}
@@ -77,7 +75,7 @@ services:
       /opt/spark/sbin/start-worker.sh spark://spark:7077 &&
       mkdir -p /tmp/spark-events &&
       start-history-server.sh &&
-      jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --ServerApp.token=$$JUPYTER_TOKEN --ServerApp.password='' --ServerApp.root_dir=/workspace
+      jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --ServerApp.token=$$JUPYTER_TOKEN --ServerApp.password='' --ServerApp.allow_origin='*' --ServerApp.trust_xheaders=True --ServerApp.root_dir=/workspace
       "
     depends_on: [minio, nessie]
     networks: [interna]
@@ -94,12 +92,14 @@ services:
       - MINIO_DOMAIN=minio
       - MINIO_REGION_NAME=us-east-1
       - MINIO_REGION=us-east-1
+      # Console atras do proxy TLS: o navegador e redirecionado para o subdominio.
+      - MINIO_BROWSER_REDIRECT_URL=https://minio.${DOMAIN:-localhost}
       - ZONA_ENTRADA=${ZONA_ENTRADA}
       - ZONA_ARMAZEM=${ZONA_ARMAZEM}
       - ZONA_HISTORICO=${ZONA_HISTORICO}
     ports:
-      - "9000:9000"    # API S3
-      - "9001:9001"    # console web
+      - "127.0.0.1:9000:9000"    # API S3 (loopback)
+      # console web (9001) sai pelo proxy: https://minio.${DOMAIN}
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 15s
@@ -149,7 +149,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     ports:
-      - "5435:5432"
+      - "127.0.0.1:5435:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./seed/postgres:/docker-entrypoint-initdb.d/:ro
@@ -165,7 +165,7 @@ services:
     container_name: ${PROJETO}_mongo
     restart: unless-stopped
     ports:
-      - "27017:27017"
+      - "127.0.0.1:27017:27017"
     environment:
       MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME}
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD}
@@ -219,13 +219,36 @@ services:
       GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
       GOTRUE_MAILER_AUTOCONFIRM: ${SUPABASE_MAILER_AUTOCONFIRM:-true}
     ports:
-      - "${SUPABASE_AUTH_PORT:-9999}:9999"
+      # So loopback: o app fala com supabase-auth:9999 pela rede interna.
+      - "127.0.0.1:${SUPABASE_AUTH_PORT:-9999}:9999"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:9999/health >/dev/null"]
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 20s
+    networks: [interna]
+
+  # ---------------------------------------------------------------------------
+  # Reverse proxy TLS. E o UNICO servico publicado na rede (80/443). As UIs HTTP
+  # (dashboard, dremio, minio, jupyter) saem por ele, por subdominio de DOMAIN,
+  # com certificado da CA interna do Caddy. Os demais servicos so publicam em
+  # loopback (127.0.0.1) — a rede externa alcanca apenas o proxy.
+  # ---------------------------------------------------------------------------
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: ${PROJETO}_caddy
+    restart: unless-stopped
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on: [dremio, spark, minio]
     networks: [interna]
 
 volumes:
@@ -235,6 +258,8 @@ volumes:
   postgres-data:
   mongo-data:
   supabase-auth-data:
+  caddy-data:
+  caddy-config:
 
 networks:
   interna:

@@ -1,0 +1,31 @@
+# Reverse proxy com TLS. Publica so o Caddy (443/80); os serviços saem daqui.
+# TLS interno: o Caddy cria uma CA local e emite certificados sozinho — sem
+# domínio público nem Let's Encrypt. O navegador avisa "não confiável" ate voce
+# confiar na CA (ver readme). Roteamento por subdomínio de {$DOMAIN} (localhost),
+# que resolve para 127.0.0.1 em Linux moderno.
+
+# Sem bloco global: o Caddy redireciona HTTP->HTTPS sozinho e usa a CA interna.
+
+# Painel Streamlit (o que o usuario final acessa)
+dashboard.{$DOMAIN:localhost} {
+	tls internal
+	reverse_proxy spark:8501
+}
+
+# Dremio (UI + REST)
+dremio.{$DOMAIN:localhost} {
+	tls internal
+	reverse_proxy dremio:9047
+}
+
+# Console do MinIO
+minio.{$DOMAIN:localhost} {
+	tls internal
+	reverse_proxy minio:9001
+}
+
+# JupyterLab (exige o JUPYTER_TOKEN)
+jupyter.{$DOMAIN:localhost} {
+	tls internal
+	reverse_proxy spark:8888
+}
