@@ -103,9 +103,49 @@ df["criterios_atendidos"] = pd.to_numeric(df["criterios_atendidos"], errors="coe
 
 st.sidebar.header("Filtros")
 territorios = sorted(df["territorio_desenvolvimento"].dropna().unique())
-sel_terr = st.sidebar.multiselect("Território de desenvolvimento", territorios, default=territorios)
 situacoes = sorted(df["situacao"].dropna().unique())
-sel_sit = st.sidebar.multiselect("Situação", situacoes, default=situacoes)
+
+# Os filtros sobrevivem ao refresh: o estado e espelhado na URL (st.query_params),
+# que persiste no reload. Ao atualizar a pagina, os multiselects sao restaurados
+# a partir da URL. "|" separa os valores (nao ocorre nos nomes).
+qp = st.query_params
+
+
+def _ler_filtro(chave, todas):
+    if chave not in qp:
+        return list(todas)          # ausente na URL => tudo selecionado
+    valor = qp[chave]
+    if valor == "":
+        return []                   # presente e vazio => nada selecionado
+    escolhidos = valor.split("|")
+    return [x for x in todas if x in escolhidos]
+
+
+def _sincronizar_filtros():
+    for chave, campo, todas in (
+        ("terr", "filtro_territorio", territorios),
+        ("sit", "filtro_situacao", situacoes),
+    ):
+        sel = st.session_state.get(campo, list(todas))
+        if set(sel) == set(todas):
+            if chave in qp:
+                del qp[chave]        # tudo selecionado => mantem a URL limpa
+        elif not sel:
+            qp[chave] = ""
+        else:
+            qp[chave] = "|".join(sel)
+
+
+sel_terr = st.sidebar.multiselect(
+    "Território de desenvolvimento", territorios,
+    default=_ler_filtro("terr", territorios),
+    key="filtro_territorio", on_change=_sincronizar_filtros,
+)
+sel_sit = st.sidebar.multiselect(
+    "Situação", situacoes,
+    default=_ler_filtro("sit", situacoes),
+    key="filtro_situacao", on_change=_sincronizar_filtros,
+)
 
 f = df[df["territorio_desenvolvimento"].isin(sel_terr) & df["situacao"].isin(sel_sit)].copy()
 if f.empty:
