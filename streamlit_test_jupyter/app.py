@@ -16,11 +16,15 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from auth.authentication import require_auth
+from app_semarh.estilo import aplicar as aplicar_estilo
 from app_semarh.painel import render
 
 load_dotenv("vars.env")
 
 st.set_page_config(page_title="Painel SEMARH", layout="wide")
+
+# Estilo responsivo (celular/tablet/desktop). Antes do login, cobre as 2 telas.
+aplicar_estilo()
 
 # Gate de autenticacao (Supabase). Devolve o usuario logado.
 user = require_auth()

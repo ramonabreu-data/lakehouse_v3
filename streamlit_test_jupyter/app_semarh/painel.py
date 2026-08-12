@@ -12,23 +12,9 @@ import streamlit as st
 
 from app_semarh.setores import SETORES
 
-_CSS = """
-<style>
-/* Botoes da sidebar como "abas" arredondadas */
-section[data-testid="stSidebar"] .stButton > button {
-    border-radius: 14px;
-    border: 1px solid rgba(128, 128, 128, 0.35);
-    justify-content: flex-start;
-    text-align: left;
-    font-weight: 500;
-    padding: 0.5rem 0.9rem;
-}
-</style>
-"""
-
 
 def render(user: dict | None) -> None:
-    st.markdown(_CSS, unsafe_allow_html=True)
+    # O estilo global (botoes, sidebar, responsividade) e aplicado em app.py.
     qp = st.query_params
     por_slug = {s["slug"]: s for s in SETORES}
 

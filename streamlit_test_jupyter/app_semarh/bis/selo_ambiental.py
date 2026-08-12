@@ -56,14 +56,20 @@ def render(user: dict | None) -> None:
         st.warning("Nenhum município para os filtros selecionados.")
         return
 
-    # --- indicadores -----------------------------------------------------
-    k = st.columns(6)
-    k[0].metric("Municípios", len(f))
-    k[1].metric("Com selo", int(f["tem_selo"].sum()))
-    k[2].metric("Selo A", int((f["selo"] == "A").sum()))
-    k[3].metric("Selo B", int((f["selo"] == "B").sum()))
-    k[4].metric("Selo C", int((f["selo"] == "C").sum()))
-    k[5].metric("Não eleg. / não hab.", int(f["situacao"].isin(["Não elegível", "Não habilitado"]).sum()))
+    # --- indicadores (grade responsiva: auto-fit, empilha no celular) ----
+    kpis = [
+        ("Municípios", len(f)),
+        ("Com selo", int(f["tem_selo"].sum())),
+        ("Selo A", int((f["selo"] == "A").sum())),
+        ("Selo B", int((f["selo"] == "B").sum())),
+        ("Selo C", int((f["selo"] == "C").sum())),
+        ("Não eleg./hab.", int(f["situacao"].isin(["Não elegível", "Não habilitado"]).sum())),
+    ]
+    cartoes = "".join(
+        f'<div class="kpi"><div class="kpi-v">{valor}</div><div class="kpi-l">{rotulo}</div></div>'
+        for rotulo, valor in kpis
+    )
+    st.markdown(f'<div class="kpi-grid">{cartoes}</div>', unsafe_allow_html=True)
 
     st.divider()
 
