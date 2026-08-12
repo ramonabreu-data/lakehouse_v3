@@ -1,0 +1,46 @@
+# Bibliotecas instaladas na imagem do Spark/Jupyter.
+# Edite e rode `docker compose build spark` para aplicar.
+#
+# A imagem base (alexmerced/spark35nb) ja traz: pandas, numpy, scipy, matplotlib,
+# seaborn, plotly, altair, scikit-learn, xgboost, lightgbm, statsmodels,
+# tensorflow, torch, keras, polars, duckdb, pyarrow, openpyxl, pyiceberg.
+# Aqui entram so as que faltam e os travamentos que mantem a base coerente.
+
+# --- travas de compatibilidade -------------------------------------------
+# A imagem base vem com protobuf 7.x, mas o TensorFlow 2.17 exige <5. Sem esta
+# trava o TF importa cuspindo "MessageFactory object has no attribute
+# GetPrototype". A faixa abaixo satisfaz TF, google-api-core e proto-plus.
+protobuf>=4.25,<5
+# numpy 2.x quebra o tensorflow 2.17 e o torch 2.4 desta imagem.
+numpy<2
+
+# --- runtime da stack ----------------------------------------------------
+streamlit
+python-dotenv
+dremio-simple-query
+# Autenticacao do dashboard: cookie de sessao criptografado no navegador.
+streamlit-cookies-manager==0.2.0
+
+# --- machine learning ----------------------------------------------------
+catboost
+imbalanced-learn
+shap                 # explicabilidade de modelo
+optuna               # busca de hiperparametros
+mlflow               # registro de experimentos
+
+# --- series temporais ----------------------------------------------------
+prophet
+
+# --- linguagem natural ---------------------------------------------------
+nltk
+spacy
+# Modelos do spacy nao vem no pacote. Para portugues, no Dockerfile:
+#   python -m spacy download pt_core_news_sm
+
+# --- geoespacial ---------------------------------------------------------
+geopandas
+folium
+
+# --- apoio ---------------------------------------------------------------
+tqdm
+missingno            # visualizacao de nulos, util no perfil dos dados

@@ -1,0 +1,27 @@
+# =============================================================================
+# Segredos — NUNCA versionar. Apenas os templates *.example entram no repo.
+# =============================================================================
+.env
+*.env
+!*.env.example
+streamlit_test_jupyter/vars.env
+env.txt
+
+# backups e rascunhos
+docker-compose.yml.save
+docker-compose.yml.bak-*
+*.bak
+*.bak-*
+
+# python / jupyter
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
+*.pyo
+
+# logs e temporarios
+*.log
+.pytest_cache/
+
+# dados locais montados (nao versionar volumes/seed pesado gerado)
+data/

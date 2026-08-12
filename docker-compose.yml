@@ -1,0 +1,235 @@
+# Stack de Data Lakehouse: Dremio + Spark + MinIO + Nessie + PostgreSQL + MongoDB
+#
+# Whitelabel: nome do projeto, prefixo dos containers, prefixo dos volumes e nomes
+# das zonas do object store vem todos do .env. Para implantar em outro cliente,
+# edite o .env — este arquivo nao precisa ser tocado.
+
+name: ${PROJETO}
+
+services:
+  dremio:
+    platform: linux/amd64
+    image: dremio/dremio-oss:26.0.5
+    container_name: ${PROJETO}_dremio
+    restart: unless-stopped
+    ports:
+      - 9047:9047      # UI / REST API
+      - 31010:31010    # ODBC/JDBC legado
+      - 32010:32010    # Arrow Flight SQL
+      - 45678:45678    # interno do cluster
+    environment:
+      - DREMIO_JAVA_SERVER_EXTRA_OPTS=-Dpaths.dist=file:///opt/dremio/data/dist
+      # Ajustado para host com pouca RAM livre. Aumente se sobrar memoria.
+      - DREMIO_MAX_HEAP_MEMORY_SIZE_MB=2048
+      - DREMIO_MAX_DIRECT_MEMORY_SIZE_MB=2048
+    volumes:
+      - dremio-data:/opt/dremio/data
+    networks: [interna]
+
+  spark:
+    platform: linux/amd64
+    # Imagem propria: base alexmerced/spark35nb + libs de ciencia de dados e ML.
+    # Construir/reconstruir:  docker compose build spark
+    build:
+      context: ./docker/spark
+    image: ${PROJETO}/spark-lakehouse:1.0
+    container_name: ${PROJETO}_spark
+    restart: unless-stopped
+    ports:
+      - 8080:8080              # Master Web UI
+      - 7077:7077              # submissao de jobs
+      - 8081:8081              # Worker Web UI
+      - 4040-4045:4040-4045    # UI por job
+      - 18080:18080            # History Server
+      - 8889:8888              # JupyterLab (8888 do host pode ja estar em uso)
+      - 8502:8501              # Streamlit  (8501 do host pode ja estar em uso)
+    environment:
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - SPARK_MASTER_HOST=spark
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8080
+      - SPARK_WORKER_WEBUI_PORT=8081
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_HISTORY_OPTS=-Dspark.history.fs.logDirectory=/tmp/spark-events
+      - SPARK_HOME=/opt/spark
+      - ZONA_ARMAZEM=${ZONA_ARMAZEM}
+      - ZONA_ENTRADA=${ZONA_ENTRADA}
+      - ZONA_HISTORICO=${ZONA_HISTORICO}
+      - MINIO_ENDPOINT=http://minio:9000
+      - NESSIE_URI=http://nessie:19120/api/v2
+      # o modulo lakehouse.py fica em /workspace/notebooks
+      - PYTHONPATH=/workspace/notebooks
+    volumes:
+      - ./seed/notebook-seed:/workspace/seed-data
+      - ./streamlit_test_jupyter:/workspace/streamlit
+      # bind mount: os notebooks-modelo ficam versionados no repositorio
+      - ./notebooks:/workspace/notebooks
+    # ATENCAO: cada comando em UMA linha. Em escalar YAML dobrado (>), linhas mais
+    # indentadas que a primeira preservam a quebra de linha, e o bash trata o resto
+    # como comando separado — as flags seguintes seriam engolidas em silencio.
+    entrypoint: >
+      /bin/bash -c "
+      /opt/spark/sbin/start-master.sh &&
+      /opt/spark/sbin/start-worker.sh spark://spark:7077 &&
+      mkdir -p /tmp/spark-events &&
+      start-history-server.sh &&
+      jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --ServerApp.token='' --ServerApp.password='' --ServerApp.root_dir=/workspace
+      "
+    depends_on: [minio, nessie]
+    networks: [interna]
+
+  minio:
+    # Ultima release com o console administrativo completo. As posteriores
+    # deixam so o navegador de objetos na edicao comunitaria.
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: ${PROJETO}_minio
+    restart: unless-stopped
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - MINIO_DOMAIN=minio
+      - MINIO_REGION_NAME=us-east-1
+      - MINIO_REGION=us-east-1
+      - ZONA_ENTRADA=${ZONA_ENTRADA}
+      - ZONA_ARMAZEM=${ZONA_ARMAZEM}
+      - ZONA_HISTORICO=${ZONA_HISTORICO}
+    ports:
+      - "9000:9000"    # API S3
+      - "9001:9001"    # console web
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    volumes:
+      - minio-data:/data
+      - ./seed/minio-data:/seed-entrada:ro
+    entrypoint: >
+      /bin/sh -c "
+      minio server /data --console-address ':9001' &
+      sleep 8;
+      mc alias set local http://localhost:9000 \"$$MINIO_ROOT_USER\" \"$$MINIO_ROOT_PASSWORD\";
+      mc mb -p local/$$ZONA_ENTRADA local/$$ZONA_ARMAZEM local/$$ZONA_HISTORICO;
+      mc cp --recursive /seed-entrada/ local/$$ZONA_ENTRADA/ || true;
+      wait"
+    networks: [interna]
+
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.108.4
+    container_name: ${PROJETO}_nessie
+    restart: unless-stopped
+    environment:
+      - QUARKUS_HTTP_PORT=19120
+      - QUARKUS_LOG_LEVEL=INFO
+      - NESSIE_VERSION_STORE_TYPE=ROCKSDB
+      # /home/nessie e do usuario nessie (uid 10000); um volume nomeado herda esse
+      # dono. Montar em /nessie cria diretorio de root e o servico morre com
+      # "RocksDBException: While mkdir if missing: Permission denied".
+      - NESSIE_VERSION_STORE_PERSIST_ROCKS_DATABASE_PATH=/home/nessie/data
+    ports:
+      - "19120:19120"
+    volumes:
+      - nessie-data:/home/nessie
+    networks: [interna]
+
+  postgres:
+    image: postgres:17
+    container_name: ${PROJETO}_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5435:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./seed/postgres:/docker-entrypoint-initdb.d/:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [interna]
+
+  mongo:
+    image: mongo:7.0    # 8.x nao inicia em kernel >= 6.19 (SERVER-121912)
+    container_name: ${PROJETO}_mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD}
+    volumes:
+      - mongo-data:/data/db
+      - ./seed/mongo:/docker-entrypoint-initdb.d/:ro
+    networks: [interna]
+
+  # ---------------------------------------------------------------------------
+  # Autenticacao do dashboard Streamlit (Supabase GoTrue + Postgres dedicado).
+  # O app em streamlit_test_jupyter/ fala com supabase-auth:9999 pela rede interna.
+  # ---------------------------------------------------------------------------
+  supabase-db:
+    image: postgres:15-alpine
+    container_name: ${PROJETO}_supabase_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${SUPABASE_DB_NAME:-supabase_auth}
+      POSTGRES_USER: ${SUPABASE_DB_USER:-supabase_auth_admin}
+      POSTGRES_PASSWORD: ${SUPABASE_DB_PASSWORD:?configure SUPABASE_DB_PASSWORD no .env}
+    volumes:
+      - supabase-auth-data:/var/lib/postgresql/data
+      - ./docker/supabase-init.sql:/docker-entrypoint-initdb.d/10-auth-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [interna]
+
+  supabase-auth:
+    image: supabase/gotrue:v2.177.0
+    container_name: ${PROJETO}_supabase_auth
+    restart: unless-stopped
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      API_EXTERNAL_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:9999}
+      GOTRUE_SITE_URL: ${APP_PUBLIC_URL:-http://localhost:8502}
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: "postgres://${SUPABASE_DB_USER:-supabase_auth_admin}:${SUPABASE_DB_PASSWORD}@supabase-db:5432/${SUPABASE_DB_NAME:-supabase_auth}?sslmode=disable"
+      GOTRUE_JWT_SECRET: ${JWT_SECRET:?configure JWT_SECRET no .env}
+      GOTRUE_JWT_EXP: ${JWT_EXPIRY_SECONDS:-3600}
+      # Papel aceito como admin da Admin API (/admin/users). O app assina um JWT
+      # service_role com o JWT_SECRET para o master criar/remover usuarios.
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_DISABLE_SIGNUP: ${SUPABASE_DISABLE_SIGNUP:-true}
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_MAILER_AUTOCONFIRM: ${SUPABASE_MAILER_AUTOCONFIRM:-true}
+    ports:
+      - "${SUPABASE_AUTH_PORT:-9999}:9999"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9999/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [interna]
+
+volumes:
+  dremio-data:
+  minio-data:
+  nessie-data:
+  postgres-data:
+  mongo-data:
+  supabase-auth-data:
+
+networks:
+  interna:
