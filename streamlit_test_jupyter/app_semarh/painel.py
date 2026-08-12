@@ -1,54 +1,86 @@
-"""Monta o painel SEMARH: cabecalho + navegacao entre as 4 areas.
+"""Navegacao do painel SEMARH.
 
-A aba ativa e espelhada na URL (`?aba=...`) para sobreviver ao refresh — por
-isso usamos `st.segmented_control` (controlavel) em vez de `st.tabs` (cuja aba
-ativa e estado so do navegador e reseta no reload). So a area selecionada e
-renderizada.
+Dois niveis, ambos espelhados na URL (sobrevivem ao refresh):
+  1. Setor  -> botoes arredondados na sidebar (?setor=...)
+  2. BI     -> cartoes na area principal; ao abrir um, ?bi=...
 
-Cada area e um modulo em `app_semarh/abas/` com uma funcao `render(user)`.
+Um setor pode ter varios BIs; hoje so a Chefia de Gabinete tem um
+(Selo Ambiental 2026). Setor sem BI abre vazio.
 """
 
 import streamlit as st
 
-from app_semarh.abas import chefia_gabinete, gestao, meio_ambiente, psi_pilares
+from app_semarh.setores import SETORES
 
-# (slug na URL, titulo exibido, modulo)
-ABAS = [
-    ("gestao", "Superintendência de Gestão", gestao),
-    ("meio_ambiente", "Superintendência de Meio Ambiente", meio_ambiente),
-    ("chefia", "Chefia de Gabinete", chefia_gabinete),
-    ("psi_pilares", "PSI&Pilares II", psi_pilares),
-]
+_CSS = """
+<style>
+/* Botoes da sidebar como "abas" arredondadas */
+section[data-testid="stSidebar"] .stButton > button {
+    border-radius: 14px;
+    border: 1px solid rgba(128, 128, 128, 0.35);
+    justify-content: flex-start;
+    text-align: left;
+    font-weight: 500;
+    padding: 0.5rem 0.9rem;
+}
+</style>
+"""
 
 
 def render(user: dict | None) -> None:
+    st.markdown(_CSS, unsafe_allow_html=True)
+    qp = st.query_params
+    por_slug = {s["slug"]: s for s in SETORES}
+
+    setor_atual = qp.get("setor")
+    if setor_atual not in por_slug:
+        # padrao: primeiro setor que tem BI (senao o primeiro da lista)
+        setor_atual = next((s["slug"] for s in SETORES if s["bis"]), SETORES[0]["slug"])
+
+    # --- sidebar: botoes dos setores ------------------------------------
+    st.sidebar.markdown("### Áreas")
+    for s in SETORES:
+        ativo = s["slug"] == setor_atual
+        if st.sidebar.button(
+            s["titulo"],
+            key=f"setor_{s['slug']}",
+            use_container_width=True,
+            type="primary" if ativo else "secondary",
+        ):
+            st.query_params["setor"] = s["slug"]
+            if "bi" in st.query_params:
+                del st.query_params["bi"]
+            st.rerun()
+
+    setor = por_slug[setor_atual]
+
+    # --- cabecalho ------------------------------------------------------
     st.title("Painel SEMARH")
     st.caption("Secretaria de Estado do Meio Ambiente e Recursos Hídricos — Piauí")
+    st.subheader(setor["titulo"])
 
-    slugs = [s for s, _, _ in ABAS]
-    titulos = {s: t for s, t, _ in ABAS}
-    modulos = {s: m for s, _, m in ABAS}
+    bis = setor["bis"]
+    if not bis:
+        st.info("Nenhum BI disponível para esta área ainda.")
+        return
 
-    qp = st.query_params
-    atual = qp.get("aba")
-    if atual not in slugs:
-        atual = slugs[0]
+    por_bi = {b["slug"]: b for b in bis}
+    bi_atual = qp.get("bi")
 
-    def _sincronizar_aba():
-        escolha = st.session_state.get("aba_ativa")
-        if escolha:
-            st.query_params["aba"] = escolha
-
-    escolhido = st.segmented_control(
-        "Área",
-        slugs,
-        format_func=lambda s: titulos[s],
-        default=atual,
-        key="aba_ativa",
-        on_change=_sincronizar_aba,
-        label_visibility="collapsed",
-    )
-
-    # segmented_control permite desmarcar (retorna None) — nesse caso mantem a
-    # ultima aba da URL.
-    modulos[escolhido or atual].render(user)
+    if bi_atual in por_bi:
+        # --- BI aberto ---
+        if st.button("← Voltar aos BIs", key="voltar_bi"):
+            del st.query_params["bi"]
+            st.rerun()
+        st.divider()
+        por_bi[bi_atual]["render"](user)
+    else:
+        # --- lista de BIs do setor ---
+        st.caption("Selecione um BI para abrir:")
+        colunas = st.columns(min(3, len(bis)))
+        for i, b in enumerate(bis):
+            if colunas[i % len(colunas)].button(
+                f"📊 {b['titulo']}", key=f"bi_{b['slug']}", use_container_width=True
+            ):
+                st.query_params["bi"] = b["slug"]
+                st.rerun()

@@ -1,4 +1,4 @@
-"""Aba Chefia de Gabinete — Painel do Selo Ambiental 2026 (SEMARH-PI).
+"""BI Selo Ambiental 2026 (SEMARH-PI) — pertence ao setor Chefia de Gabinete.
 
 Le `nessie.refinamento.semarh_painel` (via Dremio Arrow Flight) e monta:
 indicadores, distribuicao por tipo de selo e por criterios, mapa dos municipios
