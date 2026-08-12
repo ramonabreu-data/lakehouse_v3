@@ -25,11 +25,9 @@ precisa ser editado para atender um novo cliente.
 8. [Zonas do object store](#zonas-do-object-store)
 9. [Portas e endereços](#portas-e-endereços)
 10. [Matriz de versões](#matriz-de-versões)
-11. [Armadilhas conhecidas](#armadilhas-conhecidas)
-12. [Decisões do compose](#decisões-do-compose)
-13. [Solução de problemas](#solução-de-problemas)
-14. [Segurança](#segurança)
-15. [Estrutura do repositório](#estrutura-do-repositório)
+11. [Decisões do compose](#decisões-do-compose)
+12. [Segurança](#segurança)
+13. [Estrutura do repositório](#estrutura-do-repositório)
 
 ---
 
@@ -844,58 +842,6 @@ passo 4 funcionam igual.
 
 ---
 
-## Armadilhas conhecidas
-
-Coisas que custam horas e não aparecem na documentação dos projetos.
-
-| # | Armadilha | Sintoma |
-|---|---|---|
-| 1 | YAML `>` preserva a quebra de linha em linhas **mais indentadas** que a primeira | flags do entrypoint somem sem erro |
-| 2 | `--NotebookApp.token=''` não vale no JupyterLab 4 / jupyter-server 2 | Jupyter pede um token que ninguém tem |
-| 3 | `nessie-spark-extensions` ≥ 0.107 exige Java 17; a imagem do Spark tem Java 11 | `UnsupportedClassVersionError` no primeiro `spark.sql()` |
-| 4 | `docker volume create` num volume existente **não falha** | você grava dentro dos dados de outro projeto |
-| 5 | O worker do Spark precisa apontar para o hostname do master, não `localhost` | job aceito, nada executa |
-| 6 | Volume nomeado num caminho que não existe na imagem nasce como root | serviços não-root morrem com `Permission denied` |
-| 7 | `docker-entrypoint-initdb.d` só roda com o volume de dados vazio | editar o seed não tem efeito |
-
-### Armadilha 1: a folded scalar do YAML
-
-Em um escalar dobrado (`>`), linhas **mais indentadas que a primeira** não são dobradas: a quebra de
-linha é preservada. Um entrypoint escrito assim:
-
-```yaml
-entrypoint: >
-  /bin/bash -c "
-  jupyter lab --ip=0.0.0.0 --port=8888 --allow-root
-              --ServerApp.token='' --ServerApp.password=''
-  "
-```
-
-entrega ao bash um `\n` real antes de `--ServerApp.token`. Para o bash isso encerra o comando: o
-Jupyter sobe **sem as flags**, e a linha seguinte vira um comando separado que falha em silêncio.
-
-O sintoma engana: `docker inspect` e `ps` mostram a string com as flags, porque ambos exibem quebras
-de linha como espaço. O que denuncia é comparar o `argv` do processo filho com o do PID 1.
-
-Regra prática: **em entrypoint, cada comando em uma linha só.** Se precisar quebrar, use `\` no fim
-da linha ou a forma de lista (`entrypoint: ["/bin/bash", "-c", "..."]`).
-
-### Armadilha 4: colisão silenciosa de volume
-
-`docker volume create <nome>` é idempotente: se o volume já existe, **retorna sucesso** e devolve o
-existente. Num host com várias stacks, escolher um `PROJETO` já em uso e copiar dados para
-`<PROJETO>_<volume>` grava **dentro dos dados do outro projeto**. Pior: `cp -a` mescla em vez de
-substituir, e o resultado é um diretório com metade de cada.
-
-Num data dir de Postgres isso destrói o cluster: o `global/` sobrescrito leva junto o catálogo
-`pg_database`, e as bases antigas viram diretórios órfãos — os arquivos continuam no disco, mas
-nenhum servidor consegue abri-los.
-
-Nomes de projeto Compose não são reservados nem verificados. Por isso a checagem dos quatro
-namespaces em [Implantar em um novo projeto](#implantar-em-um-novo-projeto) não é opcional.
-
----
-
 ## Decisões do compose
 
 - **Tudo que identifica a implantação vem do `.env`.** `PROJETO` define nome do projeto Compose,
@@ -945,44 +891,6 @@ Ambiente de referência: Docker 29.6.1, Compose v5.3.0, kernel Linux 7.0, x86_64
 | 26 bibliotecas de DS/ML importam; `tensorflow` sem o erro de protobuf da base | ✅ |
 | Namespace do Nessie gera o prefixo correspondente dentro do armazém | ✅ |
 | Troca do `PROJETO` preservando fontes, spaces e dados (migração de volumes) | ✅ |
-
----
-
-## Solução de problemas
-
-| Sintoma | Causa provável | O que fazer |
-|---|---|---|
-| Dremio não abre na 9047 | ainda subindo, ou OOM | `docker compose logs -f dremio`; garanta ≥ 4 GB livres |
-| Dremio reinicia sozinho | falta de memória | feche aplicações ou reduza os demais serviços |
-| `bind: address already in use` | porta ocupada no host | `ss -ltnp \| grep <porta>` e mude o lado esquerdo do `:` |
-| Fonte S3 com "Access Denied" | credencial ou modo de compatibilidade | confira a access key e as 3 propriedades do passo 6 |
-| Fonte S3 com timeout | endpoint com `http://`, ou `localhost` | use `minio:9000`, sem esquema |
-| Fonte Nessie não conecta | servidor antigo ou URL sem `/api/v2` | Nessie ≥ 0.59 e `http://nessie:19120/api/v2` |
-| Nessie reinicia em loop | permissão no volume do RocksDB | monte o volume em `/home/nessie`, não em `/nessie` |
-| Mongo em loop, log cita "kernel versions 6.19 and newer" | MongoDB 8.x em kernel ≥ 6.19 | use `mongo:7.0` |
-| Tabela criada no Spark não aparece no Dremio | armazém ou branch divergentes | mesma zona nos dois lados; confira a branch no Dremio |
-| Zonas não existem após o `up` | entrypoint do MinIO falhou | `docker compose logs minio`; rode os comandos do passo 4 |
-| Spark aceita job mas nada executa | worker não registrou no master | <http://localhost:8080> → "Alive Workers"; se 0, use `spark://spark:7077` |
-| `getOrCreate()` trava | download dos JARs do Maven | confirme internet; a primeira execução leva minutos |
-| `UnsupportedClassVersionError ... version 61.0` | extensões Nessie ≥ 0.107 exigem Java 17 | use `nessie-spark-extensions-3.5_2.12:0.106.0` |
-| Jupyter pede token que ninguém tem | `--NotebookApp.token` não vale no JupyterLab 4 | use `--ServerApp.token='' --ServerApp.password=''` |
-| Flags do entrypoint ignoradas sem erro | YAML `>` preservou a quebra de linha | comando em uma linha só (ver [armadilha 1](#armadilha-1-a-folded-scalar-do-yaml)) |
-| Streamlit: "No such file app.py" | pasta não montada | volume `./streamlit_test_jupyter:/workspace/streamlit` |
-| GoTrue `unhealthy` citando `type "factor_status" does not exist` | `supabase-init.sql` pré-criou `auth.factor_type` | remova essa criação do init e recrie o volume `<PROJETO>_supabase-auth-data` (ver [Autenticação](#autenticação-do-dashboard)) |
-| Login quebra com `StreamlitDuplicateElementKey` / botão "Sair" não funciona | `streamlit-cookies-manager` × Streamlit ≥ 1.36 | garanta o `auth/cookies.py` com os monkeypatches; a lib está no `requirements.txt` |
-| Painel do master não cria usuário | `JWT_SECRET` do `vars.env` ≠ do `.env`, ou signup fechado sem admin role | iguale os `JWT_SECRET` e confira `GOTRUE_JWT_ADMIN_ROLES=service_role` |
-| Login sempre "inválido" recém-criado | `SUPABASE_MAILER_AUTOCONFIRM=false` sem SMTP | ponha `true` em dev, ou configure `GOTRUE_SMTP_*` |
-| `Conflict. The container name is already in use` | outro projeto usa o mesmo nome | troque `PROJETO` no `.env`; confira com `docker ps -a` |
-| Editei o seed e nada mudou | `initdb.d` só roda com volume vazio | `docker compose down -v`, ou remova só aquele volume |
-| Perdi tudo após `down` | usou `-v` | `docker compose stop`, ou `down` sem `-v` |
-
-```bash
-docker compose ps                    # estado dos serviços
-docker compose logs -f <serviço>     # logs em tempo real
-docker compose restart <serviço>
-docker stats --no-stream             # consumo de CPU/RAM por container
-docker compose exec dremio bash      # shell dentro do container
-```
 
 ---
 
