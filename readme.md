@@ -442,68 +442,77 @@ docker compose down -v   # apaga TAMBÉM os dados de todos os serviços
 
 ## Autenticação do dashboard
 
-O dashboard fica atrás de um login. A autenticação usa **Supabase GoTrue** (a API de auth do
-Supabase) com um Postgres dedicado — dois serviços que já vêm no `docker-compose.yml`
-(`supabase-db` e `supabase-auth`). O Streamlit continua consultando o Dremio com a conta de serviço
-do `vars.env`; o Supabase só decide **quem** entra no painel. Não subimos o Supabase Studio (a UI
-visual) — o gerenciamento de usuários é feito pelo painel do master, dentro do próprio app.
+O dashboard fica atrás de um login. Quem valida o acesso é o **Supabase GoTrue**; o Streamlit
+continua consultando o Dremio com a conta de serviço do `vars.env`. Há dois papéis: um **usuário
+master** (o único que cria/remove contas) e os **visualizadores**, que só acessam o painel.
 
-### Modelo de usuários: master + visualizadores
+### Componentes e o que cada um faz
 
-- Cadastro público **desligado** (`SUPABASE_DISABLE_SIGNUP=true`): ninguém se registra sozinho.
-- Um **usuário master** (`AUTH_MASTER_EMAIL`) é criado no primeiro boot do app, a partir do
-  `vars.env`. Se não existir, é recriado a partir dessas variáveis.
-- Só o master cria/remove usuários, pelo painel **"Administrar usuarios"** na barra lateral. Por
-  baixo, ele chama a Admin API do GoTrue (`/admin/users`) com um token `service_role` assinado
-  localmente com o `JWT_SECRET` (nunca vai ao navegador).
-- Os demais usuários apenas visualizam a aplicação.
-
-### Configuração (duas metades, de propósito)
-
-| Onde | Variáveis | Papel |
+| Componente | Onde | Função |
 |---|---|---|
-| `.env` da stack | `JWT_SECRET`, `SUPABASE_DB_PASSWORD`, `SUPABASE_DISABLE_SIGNUP`, `SUPABASE_MAILER_AUTOCONFIRM`, `SUPABASE_AUTH_PORT` | Infra do GoTrue (compose) |
-| `streamlit_test_jupyter/vars.env` | `SUPABASE_URL`, `AUTH_ENABLED`, `COOKIE_SECRET`, `AUTH_MASTER_EMAIL/PASSWORD`, `JWT_SECRET` | Cliente do app |
+| `supabase-auth` (GoTrue) | serviço no `docker-compose.yml`, porta 9999 | API de autenticação: login, tokens de sessão, `/admin/users` |
+| `supabase-db` (Postgres) | serviço no `docker-compose.yml`, sem porta no host | Banco só do GoTrue (usuários e sessões) |
+| `docker/supabase-init.sql` | roda no 1º boot do `supabase-db` | Cria o schema `auth` que o GoTrue espera |
+| `streamlit_test_jupyter/auth/authentication.py` | app | `require_auth()`: gate de login, tela de entrada e painel do master |
+| `.../auth/supabase_client.py` | app | Cliente do GoTrue + Admin API (cria/remove usuários) |
+| `.../auth/session.py` | app | Normaliza, renova e valida a sessão |
+| `.../auth/cookies.py` | app | Guarda a sessão num cookie **criptografado** no navegador |
+| conta de serviço do Dremio | `vars.env` | Usada para **consultar** o lakehouse (não é o login) |
 
-O `JWT_SECRET` aparece nos **dois** arquivos e precisa ser **idêntico**: o GoTrue assina os tokens
-com ele, e o app o usa para assinar o token de admin do painel do master. Gere os segredos com
+Papéis: o cadastro público fica **desligado** (`SUPABASE_DISABLE_SIGNUP=true`). Só o master cria
+contas, pelo painel **"Administrar usuarios"** na barra lateral — que chama a Admin API do GoTrue com
+um token `service_role` assinado localmente com o `JWT_SECRET` (nunca vai ao navegador). Depois do
+login, a sessão vai para um cookie cifrado (a chave `COOKIE_SECRET` fica no servidor) e o token é
+renovado sozinho perto de expirar.
+
+### Onde colocar as variáveis e credenciais
+
+São **dois** arquivos (ambos no `.gitignore`; copie dos `.example`). Gere cada segredo com
 `python3 -c "import secrets; print(secrets.token_urlsafe(48))"`.
 
-### Sessão e cookie
+**1) `.env` da stack** — infra do GoTrue (lido pelo `docker-compose.yml`):
 
-Depois do login, a sessão (tokens do GoTrue) é guardada num **cookie criptografado** no navegador —
-a chave de cifra fica no servidor (`COOKIE_SECRET`), o componente só enxerga o texto cifrado. O
-`access_token` é renovado pelo `refresh_token` perto de expirar; ao sair, o cookie é apagado e a
-tela de login volta. `AUTH_ENABLED=false` pula tudo isso (modo dev) e consulta direto com a conta de
-serviço.
+| Variável | Para quê |
+|---|---|
+| `JWT_SECRET` | Segredo que assina os tokens. **Deve ser idêntico** ao do `vars.env` |
+| `SUPABASE_DB_PASSWORD` | Senha do Postgres do GoTrue |
+| `SUPABASE_DISABLE_SIGNUP` | `true` = só o master cria contas |
+| `SUPABASE_MAILER_AUTOCONFIRM` | `true` = conta criada já entra (sem SMTP local) |
+| `SUPABASE_AUTH_PORT` | Porta do GoTrue no host (padrão `9999`) |
 
-### Sem servidor de e-mail
+**2) `streamlit_test_jupyter/vars.env`** — lido pelo app:
 
-`SUPABASE_MAILER_AUTOCONFIRM=true` porque não há SMTP local: as contas criadas pelo master já entram
-sem confirmar e-mail. Para produção com e-mail real, configure as variáveis `GOTRUE_SMTP_*` e ponha
-o autoconfirm em `false`.
+| Variável | Para quê |
+|---|---|
+| `DREMIO_USERNAME` / `DREMIO_PASSWORD` | Conta de serviço que **consulta** o Dremio |
+| `DREMIO_ENDPOINT` / `DREMIO_FLIGHT_ENDPOINT` | Endereços do Dremio na rede Docker |
+| `SUPABASE_URL` | `http://supabase-auth:9999` (nome de serviço na rede interna) |
+| `AUTH_ENABLED` | `true` liga o login; `false` = modo dev sem login |
+| `JWT_SECRET` | **Idêntico** ao do `.env` (o app assina o token de admin com ele) |
+| `AUTH_MASTER_EMAIL` / `AUTH_MASTER_PASSWORD` | Credenciais do usuário master |
+| `COOKIE_SECRET` | Chave (32+ caracteres) que cifra o cookie de sessão |
 
-### Módulo `auth/`
+### Passo a passo para executar
 
-`streamlit_test_jupyter/auth/`: `supabase_client.py` (cliente GoTrue + Admin API), `session.py`
-(normaliza, renova e valida a sessão), `cookies.py` (cookie criptografado) e `authentication.py`
-(`require_auth()`, telas de login e o painel do master).
+```bash
+# 1. Copie os templates e preencha os segredos (mesmo JWT_SECRET nos dois)
+cp .env.example .env
+cp streamlit_test_jupyter/vars.env.example streamlit_test_jupyter/vars.env
 
-### Armadilhas
+# 2. Suba a stack — inclui supabase-db e supabase-auth
+docker compose up -d
 
-- **`supabase-init.sql` não pode pré-criar `auth.factor_type`.** A migração de MFA do GoTrue cria
-  três tipos (`factor_type`, `factor_status`, `aal_level`) num único bloco
-  `DO ... EXCEPTION WHEN duplicate_object`; se `factor_type` já existe, o bloco cai no `EXCEPTION` e
-  **pula** os outros dois — a tabela seguinte quebra com `type "factor_status" does not exist` e o
-  GoTrue fica `unhealthy` num loop. O init só cria o schema `auth`, o `search_path` e o role
-  `postgres`. Se cair nisso, corrija o init e **recrie o volume** (o init só roda em volume novo):
-  `docker compose rm -sf supabase-auth supabase-db && docker volume rm <PROJETO>_supabase-auth-data`.
-- **`streamlit-cookies-manager` 0.2.0 × Streamlit ≥ 1.36.** A lib (sem manutenção) reusa a mesma
-  key de componente no `save()`; o Streamlit ≥ 1.36 proíbe key repetida no mesmo run e derruba o app
-  (aparecia no logout, com `StreamlitDuplicateElementKey`). O `cookies.py` aplica dois monkeypatches
-  (key única por run + troca do `st.cache` legado por `st.cache_resource`). A lib está fixada no
-  `docker/spark/requirements.txt`; depois de recriar o container `spark`, rode
-  `docker compose build spark`.
+# 3. Confirme que o GoTrue respondeu
+curl -sf http://localhost:9999/health && echo " GoTrue OK"
+
+# 4. Rode o dashboard (cria o usuário master no primeiro boot)
+docker compose exec -w /workspace/streamlit spark \
+  streamlit run app.py --server.port 8501 --server.address 0.0.0.0
+```
+
+5. Acesse <http://localhost:8502> e entre com `AUTH_MASTER_EMAIL` / `AUTH_MASTER_PASSWORD`.
+6. Na barra lateral → **Administrar usuarios**, crie as contas dos visualizadores. Eles entram com
+   e-mail e senha e só visualizam o painel.
 
 ---
 
