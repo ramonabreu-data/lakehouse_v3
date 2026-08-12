@@ -154,6 +154,12 @@ def admin_create_user(email: str, password: str) -> dict[str, Any]:
     return response.json()
 
 
+def admin_update_user(user_id: str, **fields: Any) -> None:
+    response = _admin_request("PUT", f"/admin/users/{user_id}", payload=fields)
+    if response.status_code >= 400:
+        raise AdminError(_admin_error(response, "Nao foi possivel atualizar o usuario."))
+
+
 def admin_delete_user(user_id: str) -> None:
     response = _admin_request("DELETE", f"/admin/users/{user_id}")
     if response.status_code >= 400:
@@ -161,14 +167,22 @@ def admin_delete_user(user_id: str) -> None:
 
 
 def ensure_master() -> None:
-    """Cria o usuario master a partir do vars.env, se ainda nao existir."""
+    """Garante o usuario master a partir do vars.env.
+
+    Cria se nao existir; se ja existir, mantem a senha em sincronia com o
+    `vars.env` (o arquivo e a fonte unica da verdade da credencial do master).
+    """
     email = os.environ.get("AUTH_MASTER_EMAIL", "").strip().lower()
     password = os.environ.get("AUTH_MASTER_PASSWORD", "")
     if not email or not password:
         return
-    existing = {u.get("email", "").lower() for u in admin_list_users()}
-    if email not in existing:
+    match = next(
+        (u for u in admin_list_users() if u.get("email", "").lower() == email), None
+    )
+    if match is None:
         admin_create_user(email, password)
+    else:
+        admin_update_user(match["id"], password=password)
 
 
 def is_master(user: dict[str, Any] | None) -> bool:

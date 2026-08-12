@@ -299,7 +299,7 @@ Em **Advanced Options**, as mesmas três propriedades do passo 6.
 
 ### Passo 9 — Spark + Jupyter: gravar uma tabela Iceberg
 
-Abra o JupyterLab em <http://localhost:8889> (sem token). Os modelos prontos estão em
+Abra o JupyterLab em <http://localhost:8889/?token=SEU_TOKEN> (o `JUPYTER_TOKEN` do `.env`). Os modelos prontos estão em
 `notebooks/` — comece por `00_ambiente.ipynb` e veja [Notebooks-modelo](#notebooks-modelo). O código
 abaixo é o mesmo que o `lakehouse.py` encapsula, mostrado por extenso para referência.
 
@@ -747,12 +747,12 @@ CREATE TABLE nessie.coleta.funcionarios (id INT, nome VARCHAR, salario DOUBLE);
 | Spark Worker | 8081 | Web UI |
 | Spark Jobs | 4040–4045 | UI por aplicação em execução |
 | Spark History | 18080 | histórico de jobs |
-| JupyterLab | **8889** | notebooks (sem token) — mapeada da 8888 interna |
+| JupyterLab | **8889** | notebooks (exige `JUPYTER_TOKEN`) — mapeada da 8888 interna |
 | Streamlit | **8502** | dashboard — mapeada da 8501 interna |
 | Supabase GoTrue | 9999 | API de autenticação do dashboard |
 | MinIO | 9000 | API S3 |
 | MinIO | 9001 | console web |
-| Nessie | 19120 | API REST (`/api/v2`) |
+| Nessie | 19120 | API REST (`/api/v2`) — publicada só em `127.0.0.1` |
 | PostgreSQL | 5435 | mapeada da 5432 interna |
 | MongoDB | 27017 | — |
 
@@ -873,7 +873,7 @@ Ambiente de referência: Docker 29.6.1, Compose v5.3.0, kernel Linux 7.0, x86_64
 | Postgres 17: seed `001_init.sql` aplicado | ✅ |
 | Mongo 7.0: seed `001_init.js` aplicado | ✅ |
 | Spark master `ALIVE` com 1 worker registrado | ✅ |
-| JupyterLab acessível sem token em `:8889` | ✅ |
+| JupyterLab exige `JUPYTER_TOKEN` em `:8889` | ✅ |
 | Dremio 26.0.5: fontes `minio`, `nessie`, `postgres` e `mongo` conectadas | ✅ |
 | Dremio: CSVs da zona `entrada` promovidos e consultáveis | ✅ |
 | Dremio: `CREATE TABLE` + `INSERT` Iceberg gravando em `s3a://armazem/coleta/` | ✅ |
@@ -896,13 +896,21 @@ Ambiente de referência: Docker 29.6.1, Compose v5.3.0, kernel Linux 7.0, x86_64
 
 ## Segurança
 
-Esta stack é **para desenvolvimento local**. Antes de expor qualquer porta fora da máquina:
+Esta stack é **para desenvolvimento local**. O que já foi endurecido e o que ainda falta antes de
+expor fora da máquina:
 
-- O JupyterLab sobe **sem token e sem senha** (`--ServerApp.token='' --ServerApp.password=''`). É
-  execução remota de código aberta a quem alcançar a porta 8889. Para expor, remova as duas flags e
-  use o token gerado, ou publique atrás de proxy autenticado.
-- O Nessie está com autenticação `NONE`.
-- MinIO e Dremio trafegam em HTTP puro, sem TLS.
+- **JupyterLab exige token** (`JUPYTER_TOKEN` no `.env`). Sem ele o serviço nem sobe (o compose usa
+  `${JUPYTER_TOKEN:?...}`). Acesse `http://localhost:8889/?token=<seu-token>`. Isso fecha a execução
+  remota de código que ficava aberta na porta 8889.
+- **Nessie publicado só em loopback** (`127.0.0.1:19120`). Ele não tem autenticação (`NONE`), então
+  não fica exposto à rede — o Dremio e o Spark o alcançam por dentro da rede Docker (`nessie:19120`).
+- **Dashboard com login** (Supabase GoTrue) e **cadastro público desligado**; só o master cria
+  contas. A Admin API (`/admin/users`) só abre com um token `service_role` assinado com o
+  `JWT_SECRET` — validado: sem token → 401, token forjado → 403.
+- **Falta TLS.** MinIO, Dremio e GoTrue trafegam em HTTP. Para uso remoto real, ponha um proxy
+  reverso (nginx/Caddy) com TLS na frente e publique só o proxy.
+- O cookie de sessão é **criptografado** (chave no servidor), mas não é `HttpOnly` — limitação da
+  lib `streamlit-cookies-manager`. Como o valor é cifrado, o risco de roubo por XSS é baixo.
 - Use access keys de serviço no MinIO (passo 4) em vez da credencial root, com política restrita por
   zona.
 - Nenhuma senha deve ficar no `docker-compose.yml` nem em arquivo versionado. `.env` e

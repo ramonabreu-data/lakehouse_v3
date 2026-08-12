@@ -61,6 +61,8 @@ services:
       - NESSIE_URI=http://nessie:19120/api/v2
       # o modulo lakehouse.py fica em /workspace/notebooks
       - PYTHONPATH=/workspace/notebooks
+      # Token do JupyterLab. Sem ele, a porta 8889 e execucao de codigo aberta.
+      - JUPYTER_TOKEN=${JUPYTER_TOKEN:?configure JUPYTER_TOKEN no .env}
     volumes:
       - ./seed/notebook-seed:/workspace/seed-data
       - ./streamlit_test_jupyter:/workspace/streamlit
@@ -75,7 +77,7 @@ services:
       /opt/spark/sbin/start-worker.sh spark://spark:7077 &&
       mkdir -p /tmp/spark-events &&
       start-history-server.sh &&
-      jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --ServerApp.token='' --ServerApp.password='' --ServerApp.root_dir=/workspace
+      jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --ServerApp.token=$$JUPYTER_TOKEN --ServerApp.password='' --ServerApp.root_dir=/workspace
       "
     depends_on: [minio, nessie]
     networks: [interna]
@@ -130,7 +132,10 @@ services:
       # "RocksDBException: While mkdir if missing: Permission denied".
       - NESSIE_VERSION_STORE_PERSIST_ROCKS_DATABASE_PATH=/home/nessie/data
     ports:
-      - "19120:19120"
+      # Nessie nao tem autenticacao (auth NONE). Publicamos so em loopback: o
+      # Dremio e o Spark o acessam por dentro da rede (nessie:19120); o host so
+      # alcanca via localhost, nunca pela rede externa.
+      - "127.0.0.1:19120:19120"
     volumes:
       - nessie-data:/home/nessie
     networks: [interna]
