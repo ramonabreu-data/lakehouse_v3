@@ -24,10 +24,9 @@ precisa ser editado para atender um novo cliente.
 7. [Imagem do Spark/Jupyter](#imagem-do-sparkjupyter)
 8. [Zonas do object store](#zonas-do-object-store)
 9. [Portas e endereços](#portas-e-endereços)
-10. [Matriz de versões](#matriz-de-versões)
-11. [Decisões do compose](#decisões-do-compose)
-12. [Segurança](#segurança)
-13. [Estrutura do repositório](#estrutura-do-repositório)
+10. [Validação de ponta a ponta](#validação-de-ponta-a-ponta)
+11. [Segurança](#segurança)
+12. [Estrutura do repositório](#estrutura-do-repositório)
 
 ---
 
@@ -89,7 +88,7 @@ demais serviços só publicam em `127.0.0.1`. Ver [Portas e endereços](#portas-
 | RAM livre | **8 GB** (12 GB confortável) | o Dremio sozinho quer ~4 GB; Spark + Jupyter mais 2–3 GB |
 | Disco livre | ~15 GB | as imagens somam ~8 GB |
 | CPU | x86_64 com AVX | obrigatório para MongoDB 5.0+ |
-| Kernel Linux | qualquer | **se ≥ 6.19, fique em `mongo:7.0`** — ver [MongoDB](#mongodb-teto-e-piso) |
+| Kernel Linux | qualquer | **se ≥ 6.19, use `mongo:7.0`** — o MongoDB 8.x não sobe em kernel ≥ 6.19 |
 | Internet | sim | imagens e, no primeiro run do Spark, os JARs do Iceberg/Nessie |
 
 ```bash
@@ -594,8 +593,8 @@ perfil(df)                       # linhas, tipos, nulos, distintos
 gravar(df, "coleta.pedidos")     # tabela Iceberg no catálogo
 ```
 
-As versões de Iceberg e das extensões Nessie estão fixadas ali com o motivo ao lado — veja
-[matriz de versões](#matriz-de-versões) antes de mexer.
+As versões de Iceberg e das extensões Nessie estão fixadas ali com o motivo ao lado — não mexa sem
+necessidade.
 
 ### Fontes além das quatro
 
@@ -794,103 +793,7 @@ Dentro da rede Docker os serviços se falam pelo nome (`dremio:9047`, `minio:900
 
 ---
 
-## Matriz de versões
-
-Levantamento de **11/08/2026** nos registries e na documentação de cada projeto. As versões da coluna
-"Em uso" são as aplicadas no compose.
-
-| Serviço | Em uso | Mais recente | Por que não a mais recente |
-|---|---|---|---|
-| Dremio | `dremio/dremio-oss:26.0.5` | 26.0.5 | é a mais recente; a tag está fixada de propósito, `latest` muda sem aviso |
-| Spark/Jupyter | imagem própria sobre `alexmerced/spark35nb:latest` | Spark 3.5.2 | base da comunidade + libs de DS/ML — ver [Imagem do Spark/Jupyter](#imagem-do-sparkjupyter) |
-| MinIO | `RELEASE.2025-04-22T22-12-26Z` | `RELEASE.2025-09-07T16-13-09Z` | as posteriores removem o console administrativo — ver abaixo |
-| Nessie | `ghcr.io/projectnessie/nessie:0.108.4` | 0.108.4 | é a mais recente; note o **registry**, não é o Docker Hub |
-| PostgreSQL | `postgres:17` | 18.4 | 17 é a escolha conservadora; 18 também serve |
-| MongoDB | `mongo:7.0` | 8.3.7 | 8.x não inicia em kernel ≥ 6.19 — ver abaixo |
-| Iceberg (Spark) | 1.9.2 | 1.11.0 | 1.10+ traz o formato v3, que o Dremio 26 não lê com segurança |
-| Extensões Nessie (Spark) | 0.106.0 | 0.108.4 | 0.107+ exige Java 17; a imagem do Spark tem Java 11 |
-
-### Nessie: três armadilhas somadas
-
-1. **Versão.** O Dremio exige servidor Nessie **≥ 0.59.0** com endpoint `/api/v2`. Versões antigas
-   só falam API v1 e a fonte simplesmente não conecta.
-2. **Registry.** O Nessie **parou de publicar no Docker Hub na 0.76.6** (jan/2024). As versões atuais
-   estão só em `ghcr.io/projectnessie/nessie` e `quay.io/projectnessie/nessie`. Trocar a tag no
-   Docker Hub não resolve.
-3. **Configuração.** `QUARKUS_DATASOURCE_DB_KIND=rocksdb` e
-   `QUARKUS_DATASOURCE_JDBC_URL=jdbc:rocksdb:...` — o padrão que circula em blogs antigos — **não
-   configuram o RocksDB do Nessie**. `QUARKUS_DATASOURCE_*` é o datasource JDBC do Quarkus, não o
-   version store. Na prática o Nessie cai para memória e perde tudo a cada restart.
-
-A configuração correta, validada:
-
-```yaml
-image: ghcr.io/projectnessie/nessie:0.108.4
-environment:
-  - NESSIE_VERSION_STORE_TYPE=ROCKSDB
-  - NESSIE_VERSION_STORE_PERSIST_ROCKS_DATABASE_PATH=/home/nessie/data
-volumes:
-  - nessie-data:/home/nessie
-```
-
-O caminho `/home/nessie` não é arbitrário: a imagem roda como usuário não-root `nessie`
-(uid 10000, gid 10001), e um volume nomeado herda o dono do diretório que já existe na imagem.
-Montar em `/nessie` cria um diretório de root e o Nessie morre no boot com
-`RocksDBException: While mkdir if missing: /nessie/data: Permission denied`.
-
-### MongoDB: teto e piso
-
-- **Piso:** o Dremio 26 declara suporte a **MongoDB 6.0+**.
-- **Teto:** o **MongoDB 8.x se recusa a iniciar em kernel Linux ≥ 6.19**
-  ([SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912)). O container entra em loop de
-  restart com:
-
-  ```
-  MongoDB cannot start: Linux kernel versions 6.19 and newer has a known
-  incompatibility with this version of MongoDB.
-  ```
-
-Verificado em kernel 7.0: `mongo:8.3` ❌, `mongo:8.0.28` ❌, **`mongo:7.0` ✅**. Daí a escolha da
-7.0 — atende o mínimo do Dremio e é a mais nova que roda em kernel recente. Reavalie quando a
-MongoDB publicar a correção; em kernel < 6.19 a 8.0 é uma opção.
-
-MongoDB 5.0+ também exige CPU com AVX.
-
-### MinIO: atualizar tem um custo
-
-A partir da **`RELEASE.2025-05-24`** a MinIO removeu a administração do console web na edição
-comunitária (AGPL): sobrou o navegador de objetos. Gestão de usuários, políticas, buckets, lifecycle
-e replicação passaram a ser exclusivas do `mc` (CLI) ou da edição paga AIStor.
-
-- Quer a interface administrativa completa → **`RELEASE.2025-04-22T22-12-26Z`**, a última com o
-  console inteiro. É a que o compose usa.
-- Não se importa em administrar por CLI → `RELEASE.2025-09-07T16-13-09Z`, a mais recente.
-
-Nos dois casos a imagem `minio/minio` **continua trazendo o `mc` embutido**, então os comandos do
-passo 4 funcionam igual.
-
----
-
-## Decisões do compose
-
-- **Tudo que identifica a implantação vem do `.env`.** `PROJETO` define nome do projeto Compose,
-  prefixo dos containers e dos volumes. `ZONA_*` define os buckets.
-- **Rede `interna`.** Fica `${PROJETO}_interna` no Docker. O nome genérico evita colisão entre
-  implantações no mesmo host.
-- **`$$` nos entrypoints.** No Compose, `$$` escapa a interpolação e entrega um `$` literal ao shell
-  do container, para que a variável seja lida lá dentro. `$VAR` seria substituído pelo Compose ainda
-  no host.
-- **`wait` em vez de `tail -f /dev/null`.** Mantém o PID 1 aguardando o processo do MinIO: se ele
-  cair, o container cai junto e o healthcheck acusa, em vez de ficar "up" com o MinIO morto.
-- **`restart: unless-stopped`.** Com `always`, um serviço mal configurado entra em loop infinito e
-  esconde o erro real.
-- **Volume do Nessie em `/home/nessie`.** Pelo motivo de propriedade descrito na
-  [matriz de versões](#nessie-três-armadilhas-somadas).
-- **Heap do Dremio em 2 GB + 2 GB direct.** O padrão (4 GB + 8 GB) não cabe em máquina de 16 GB com
-  outras stacks. Se sobrar memória, aumente `DREMIO_MAX_HEAP_MEMORY_SIZE_MB`.
-- **Seeds montados como `:ro`.** Evita que um container reescreva os arquivos de origem.
-
-### Validação de ponta a ponta
+## Validação de ponta a ponta
 
 Ambiente de referência: Docker 29.6.1, Compose v5.3.0, kernel Linux 7.0, x86_64 com AVX2, 16 GB RAM.
 
