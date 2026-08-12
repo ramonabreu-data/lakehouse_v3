@@ -46,11 +46,15 @@ def _bootstrap_master() -> None:
 
 
 def _apply_session(cookies, session: dict[str, Any]) -> None:
-    cookie_store.save(cookies, session)
+    # NAO grava o cookie aqui: o st.rerun() abaixo descartaria o render do
+    # componente e o cookie nunca chegaria ao navegador (=> logout a cada
+    # refresh). Marca a persistencia; ela e efetivada no proximo run, que
+    # COMPLETA (renderiza o dashboard) e ai o cookie e realmente gravado.
     st.session_state.update(
         authenticated=True, auth_session=session, user=session.get("user")
     )
     st.session_state.pop("_logged_out", None)
+    st.session_state["_persistir_cookie"] = True
     st.rerun()
 
 
@@ -153,7 +157,9 @@ def require_auth() -> dict[str, Any] | None:
     if raw:
         try:
             restored = session_service.restore(raw)
-            if restored != raw:
+            # Persiste o cookie quando a sessao foi renovada OU logo apos o login
+            # (flag posta em _apply_session) — este run completa e grava de fato.
+            if st.session_state.pop("_persistir_cookie", False) or restored != raw:
                 cookie_store.save(cookies, restored)
             st.session_state.update(
                 authenticated=True, auth_session=restored, user=restored.get("user")
