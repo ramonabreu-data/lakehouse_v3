@@ -125,7 +125,8 @@ docker network ls --format '{{.Name}}'  | grep "^${NOME}_"
 
 Os quatro precisam voltar vazios.
 
-**2. Escreva o `.env`.**
+**2. Escreva o `.env`** (copie de `.env.example` e preencha). O arquivo completo, com todas as
+variáveis e comentários, é o `.env.example`; o essencial:
 
 ```ini
 # identidade: nome do projeto Compose, prefixo dos containers e dos volumes
@@ -143,10 +144,21 @@ POSTGRES_PASSWORD=troque-esta-senha
 POSTGRES_DB=nome_do_banco
 MONGO_INITDB_ROOT_USERNAME=mongo_admin
 MONGO_INITDB_ROOT_PASSWORD=troque-esta-senha
+
+# --- autenticação (Supabase) e proxy — obrigatórias, o compose falha sem elas ---
+# gere cada segredo: python3 -c "import secrets; print(secrets.token_urlsafe(48))"
+JWT_SECRET=troque-por-um-valor-forte      # DEVE ser igual ao JWT_SECRET do vars.env
+SUPABASE_DB_PASSWORD=troque-esta-senha
+JUPYTER_TOKEN=gere-um-token               # sem ele o JupyterLab nem sobe
+DOMAIN=localhost                          # subdomínios do proxy: dashboard./dremio./...
 ```
 
 Senhas do MinIO precisam de **no mínimo 8 caracteres**. Evite `$`, `&`, `)` e `!`: exigem escape em
 YAML e em shell, e são a origem da maioria dos "senha incorreta" aqui.
+
+O **dashboard** tem um segundo arquivo, `streamlit_test_jupyter/vars.env` (copie de
+`vars.env.example`), com as credenciais do Dremio, o `JWT_SECRET` (idêntico ao do `.env`), o
+`COOKIE_SECRET` e o usuário master. Ver [Autenticação do dashboard](#autenticação-do-dashboard).
 
 **3. Troque os dados de exemplo.** Os seeds em `seed/` são de demonstração — substitua pelos do
 projeto. Lembre que `docker-entrypoint-initdb.d` só roda com o volume de dados vazio.
@@ -175,11 +187,13 @@ cd dremio-spark-minio
 mkdir -p seed/minio-data seed/postgres seed/mongo seed/notebook-seed
 ```
 
-Crie o `.env` conforme [Implantar em um novo projeto](#implantar-em-um-novo-projeto). O Compose lê
-esse arquivo automaticamente. Ele **nunca** deve ser versionado:
+Copie os dois arquivos de configuração dos templates e preencha conforme
+[Implantar em um novo projeto](#implantar-em-um-novo-projeto). O Compose lê o `.env`
+automaticamente. Ambos já estão no `.gitignore` do repositório — **nunca** os versione.
 
 ```bash
-printf '.env\nstreamlit_test_jupyter/vars.env\ndocker-compose.yml.save\n' >> .gitignore
+cp .env.example .env
+cp streamlit_test_jupyter/vars.env.example streamlit_test_jupyter/vars.env
 ```
 
 ### Passo 2 — Subir a stack
@@ -429,8 +443,9 @@ docker compose exec -w /workspace/streamlit spark \
 Acesse <https://dashboard.localhost> e entre com o usuário **master** (criado no primeiro boot a partir do
 `vars.env`). Pela barra lateral → **Administrar usuarios**, crie as contas de quem vai visualizar.
 
-> A porta 8501 é a de **dentro** do container; no host ela sai em **8502**. A pasta chega ao
-> container pelo volume `./streamlit_test_jupyter:/workspace/streamlit`, e o `streamlit` já vem
+> O Streamlit roda na porta 8501 **dentro** do container e não é publicado no host: o acesso é por
+> `https://dashboard.localhost` (proxy Caddy). A pasta chega ao container pelo volume
+> `./streamlit_test_jupyter:/workspace/streamlit`, e o `streamlit` já vem
 > instalado pelo entrypoint.
 >
 > Para desligar o login em desenvolvimento, use `AUTH_ENABLED=false` no `vars.env`.
@@ -515,7 +530,7 @@ docker compose exec -w /workspace/streamlit spark \
   streamlit run app.py --server.port 8501 --server.address 0.0.0.0
 ```
 
-5. Acesse <http://localhost:8502> e entre com `AUTH_MASTER_EMAIL` / `AUTH_MASTER_PASSWORD`.
+5. Acesse <https://dashboard.localhost> e entre com `AUTH_MASTER_EMAIL` / `AUTH_MASTER_PASSWORD`.
 6. Na barra lateral → **Administrar usuarios**, crie as contas dos visualizadores. Eles entram com
    e-mail e senha e só visualizam o painel.
 
@@ -525,7 +540,7 @@ docker compose exec -w /workspace/streamlit spark \
 
 A pasta `notebooks/` traz modelos prontos para conectar fontes externas, tratar os dados e
 entregá-los ao Streamlit. Ela é montada no container, então o que você editar no JupyterLab
-(<http://localhost:8889>) fica versionado no repositório.
+(<https://jupyter.localhost>) fica versionado no repositório.
 
 ```
     origem externa                 tratamento                    consumo
@@ -889,7 +904,7 @@ Ambiente de referência: Docker 29.6.1, Compose v5.3.0, kernel Linux 7.0, x86_64
 | Postgres 17: seed `001_init.sql` aplicado | ✅ |
 | Mongo 7.0: seed `001_init.js` aplicado | ✅ |
 | Spark master `ALIVE` com 1 worker registrado | ✅ |
-| JupyterLab exige `JUPYTER_TOKEN` em `:8889` | ✅ |
+| JupyterLab exige `JUPYTER_TOKEN` (via `https://jupyter.localhost`) | ✅ |
 | Dremio 26.0.5: fontes `minio`, `nessie`, `postgres` e `mongo` conectadas | ✅ |
 | Dremio: CSVs da zona `entrada` promovidos e consultáveis | ✅ |
 | Dremio: `CREATE TABLE` + `INSERT` Iceberg gravando em `s3a://armazem/coleta/` | ✅ |
