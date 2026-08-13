@@ -90,6 +90,53 @@ flowchart LR
     WRK -.->|carimbo de atualização| STL
 ```
 
+### O caminho do dado
+
+```
+  origem            entrada          refinamento         publicação          consumo
+ ┌────────┐      ┌───────────┐     ┌────────────┐     ┌───────────┐     ┌────────────┐
+ │ banco  │      │  MinIO    │     │   Spark    │     │  Dremio   │     │ Streamlit  │
+ │ CSV    │ ───► │ zona      │ ──► │ limpa e    │ ──► │ expõe SQL │ ──► │ gráficos e │
+ │ API    │      │ entrada   │     │ agrega     │     │ federado  │     │ mapa       │
+ └────────┘      └───────────┘     └─────┬──────┘     └─────▲─────┘     └────────────┘
+                                         │ Iceberg          │ lê catálogo
+                                         ▼                  │
+                                  ┌─────────────┐     ┌───────────┐
+                                  │ MinIO       │◄────│  Nessie   │
+                                  │ zona armazém│     │ catálogo  │
+                                  └─────────────┘     └───────────┘
+```
+
+1. **O arquivo chega na zona `entrada`** do MinIO — subido à mão, por script ou por um notebook de
+   coleta. Aqui o dado fica **exatamente como veio da origem**, sem tratamento.
+2. **O Spark lê, trata e grava como tabela Iceberg** na zona `armazem`. Os arquivos de dados vão
+   para o object store; os **metadados da tabela** (quais arquivos formam a versão atual, o schema,
+   o histórico) vão para o **Nessie**.
+3. **O Dremio enxerga o Nessie como catálogo** e passa a servir aquelas tabelas por SQL — junto com
+   o PostgreSQL, o MongoDB e os arquivos soltos do MinIO, tudo na mesma consulta.
+4. **O painel consulta o Dremio por Arrow Flight** (`:32010`), um protocolo binário colunar: o
+   resultado chega como Arrow e vira `DataFrame` sem serialização intermediária.
+5. **O usuário acessa só o Caddy** (443), que termina o TLS e roteia por subdomínio para o painel,
+   o Dremio, o MinIO e o Jupyter. Nenhum outro serviço é publicado na rede.
+
+Em paralelo, o **Celery** refaz os passos 2 e 3 todo dia às 7h, varre o ambiente atrás do que mudou
+e avisa no Telegram — ver [Atualização automática](#atualização-automática-celery).
+
+### O que cada peça faz
+
+| Peça | O que faz | Por que está aqui |
+|---|---|---|
+| **MinIO** | Object store compatível com S3, dividido em três zonas | Guarda arquivo bruto e tabela Iceberg pelo mesmo protocolo do S3 — o que roda aqui roda na nuvem sem reescrever caminho |
+| **Spark** | Processamento distribuído; lê JDBC/CSV/JSON e escreve Iceberg | É quem transforma. Ler um banco externo inteiro e reescrever em colunar é trabalho de motor, não de query engine |
+| **Iceberg** | Formato de tabela sobre os arquivos | Dá `UPDATE`/`DELETE`, evolução de schema e leitura consistente enquanto alguém escreve — o que "pasta de parquet" não dá |
+| **Nessie** | Catálogo Iceberg com versionamento tipo git | Sabe qual é a versão atual de cada tabela e permite branch/tag: dá para testar uma carga num branch sem afetar quem consulta o `main` |
+| **Dremio** | Query engine federada + camada semântica (spaces/views) | Junta lakehouse, PostgreSQL e MongoDB numa consulta só, sem copiar dado, e serve o resultado por Arrow Flight |
+| **Streamlit** | O painel que o usuário final abre | Interface em Python puro: quem escreve o notebook escreve a tela, sem stack de frontend |
+| **Caddy** | Proxy reverso com TLS automático | Único serviço exposto: emite os certificados sozinho (CA interna) e mantém o resto fora da rede |
+| **Supabase GoTrue** | Login do painel (usuários, sessões, tokens) | Autenticação pronta e testada, com banco próprio — o painel não guarda senha |
+| **Celery + Redis** | Agenda e executa a carga diária; Redis é a fila | Tira o "alguém precisa rodar o notebook" do processo, e dá histórico do que rodou |
+| **PostgreSQL / MongoDB** | Bancos de origem de exemplo | Representam os sistemas que já existem na casa e viram fonte federada no Dremio |
+
 ### Os 13 serviços
 
 | Serviço | Papel | Publicado |
