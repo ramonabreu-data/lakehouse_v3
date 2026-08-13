@@ -9,7 +9,7 @@
 # Painel Streamlit (o que o usuario final acessa)
 dashboard.{$DOMAIN:localhost} {
 	tls internal
-	reverse_proxy spark:8501
+	reverse_proxy dashboard:8501
 }
 
 # Dremio (UI + REST)

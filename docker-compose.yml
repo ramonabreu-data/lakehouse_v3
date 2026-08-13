@@ -35,7 +35,8 @@ services:
     container_name: ${PROJETO}_spark
     restart: unless-stopped
     ports:
-      # Streamlit e Jupyter saem pelo proxy (dashboard./jupyter.${DOMAIN}).
+      # Jupyter sai pelo proxy (jupyter.${DOMAIN}); o painel Streamlit tem
+      # servico proprio (dashboard) e sai em dashboard.${DOMAIN}.
       # 7077 e so interno (spark://spark:7077). UIs do Spark ficam em loopback.
       - "127.0.0.1:8080:8080"              # Master Web UI
       - "127.0.0.1:8081:8081"              # Worker Web UI
@@ -78,6 +79,45 @@ services:
       jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --ServerApp.token=$$JUPYTER_TOKEN --ServerApp.password='' --ServerApp.allow_origin='*' --ServerApp.trust_xheaders=True --ServerApp.root_dir=/workspace
       "
     depends_on: [minio, nessie]
+    networks: [interna]
+
+  # ---------------------------------------------------------------------------
+  # Dashboard Streamlit. Servico proprio (mesma imagem do spark) para subir junto
+  # com a stack, sem `docker compose exec` nem notebook manual. Separado do spark
+  # para poder reiniciar/ver log do painel sem derrubar Jupyter e Spark.
+  # ---------------------------------------------------------------------------
+  dashboard:
+    platform: linux/amd64
+    # Mesma imagem do spark: ja tem streamlit, dremio-simple-query e o resto.
+    build:
+      context: ./docker/spark
+    image: ${PROJETO}/spark-lakehouse:1.0
+    container_name: ${PROJETO}_dashboard
+    restart: unless-stopped
+    working_dir: /workspace/streamlit
+    environment:
+      # O app tambem faz load_dotenv("vars.env"); estes sao os defaults da stack.
+      - PYTHONUNBUFFERED=1
+      - SUPABASE_URL=http://supabase-auth:9999
+      - JWT_SECRET=${JWT_SECRET}
+    volumes:
+      - ./streamlit_test_jupyter:/workspace/streamlit
+    # 8501 nao e publicado no host: o acesso e por https://dashboard.${DOMAIN}.
+    entrypoint: >
+      /bin/bash -c "
+      streamlit run app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true --browser.gatherUsageStats false
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8501/_stcore/health >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      dremio:
+        condition: service_started
+      supabase-auth:
+        condition: service_healthy
     networks: [interna]
 
   minio:
@@ -248,7 +288,7 @@ services:
       - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
-    depends_on: [dremio, spark, minio]
+    depends_on: [dremio, spark, minio, dashboard]
     networks: [interna]
 
 volumes:

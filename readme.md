@@ -46,7 +46,7 @@ flowchart LR
 
     SPK[Spark 3.5 + Jupyter<br/>escrita Iceberg]
     DRE[Dremio<br/>SQL federado + reflections]
-    STL[Streamlit<br/>dashboard]
+    STL[Streamlit<br/>serviço dashboard]
 
     subgraph Auth
         GT[Supabase GoTrue<br/>login + sessão]
@@ -204,11 +204,18 @@ docker compose up -d
 docker compose ps
 ```
 
-Em máquina apertada, suba em duas etapas:
+Isso sobe **tudo**, inclusive o painel: o serviço `dashboard` roda o Streamlit no boot da stack
+(nada de iniciar à mão pelo Jupyter). Ele usa a mesma imagem do `spark`, então o
+`docker compose build spark` acima já serve para os dois. Antes do primeiro `up`, preencha o
+`streamlit_test_jupyter/vars.env` ([passo 10](#passo-10--streamlit)) — sem ele o painel sobe, mas
+não consulta o Dremio nem faz login.
+
+Em máquina apertada, suba em etapas:
 
 ```bash
 docker compose up -d minio nessie postgres mongo
 docker compose up -d dremio spark
+docker compose up -d dashboard caddy
 ```
 
 ### Passo 3 — Validar que tudo respondeu
@@ -219,8 +226,12 @@ curl -sf http://localhost:19120/api/v2/config     && echo "Nessie  OK"
 curl -skf -o /dev/null https://dremio.localhost    && echo "Dremio  OK (via proxy)"
 curl -sf -o /dev/null http://localhost:8080       && echo "Spark   OK"
 curl -sf  http://localhost:9999/health             && echo "GoTrue  OK"
-curl -skf -o /dev/null https://dashboard.localhost  && echo "Proxy   OK"
+curl -skf -o /dev/null https://dashboard.localhost  && echo "Painel  OK (via proxy)"
 ```
+
+Todos os containers devem aparecer `Up` em `docker compose ps`; `dashboard`, `minio`, `postgres`,
+`supabase-db` e `supabase-auth` têm healthcheck e ficam `Up (healthy)`. O `dashboard` espera o
+`supabase-auth` ficar saudável antes de iniciar, então leva alguns segundos a mais que os demais.
 
 O Dremio leva **1 a 3 minutos** no primeiro boot. Acompanhe com `docker compose logs -f dremio`.
 
@@ -432,11 +443,15 @@ COOKIE_SECRET=<32+ caracteres>
 
 Os endpoints usam nomes de serviço porque o app roda **dentro** da rede Docker. Os serviços de
 autenticação (`supabase-db`, `supabase-auth`) já sobem com o `docker compose up -d` do passo 2.
-Ajuste a query em `app.py` para um dataset que exista no seu Dremio e rode:
+Ajuste a query em `app.py` para um dataset que exista no seu Dremio.
+
+O painel **sobe sozinho** junto com a stack: é o serviço `dashboard`, iniciado pelo
+`docker compose up -d` do passo 2 e reiniciado automaticamente (`restart: unless-stopped`). Não é
+preciso rodar nada à mão pelo Jupyter. Depois de editar o `vars.env` ou o código do app:
 
 ```bash
-docker compose exec -w /workspace/streamlit spark \
-  streamlit run app.py --server.port 8501 --server.address 0.0.0.0
+docker compose restart dashboard      # aplica vars.env / mudanças estruturais
+docker compose logs -f dashboard      # acompanha o log do painel
 ```
 
 Acesse <https://dashboard.localhost> e entre com o usuário **master** (criado no primeiro boot a partir do
@@ -444,8 +459,9 @@ Acesse <https://dashboard.localhost> e entre com o usuário **master** (criado n
 
 > O Streamlit roda na porta 8501 **dentro** do container e não é publicado no host: o acesso é por
 > `https://dashboard.localhost` (proxy Caddy). A pasta chega ao container pelo volume
-> `./streamlit_test_jupyter:/workspace/streamlit`, e o `streamlit` já vem
-> instalado pelo entrypoint.
+> `./streamlit_test_jupyter:/workspace/streamlit` — como é bind mount, editar um `.py` recarrega o
+> app na hora, sem restart. O serviço usa a mesma imagem do `spark`, então `streamlit` e
+> `dremio-simple-query` já estão instalados.
 >
 > Para desligar o login em desenvolvimento, use `AUTH_ENABLED=false` no `vars.env`.
 
@@ -469,6 +485,7 @@ master** (o único que cria/remove contas) e os **visualizadores**, que só aces
 
 | Componente | Onde | Função |
 |---|---|---|
+| `dashboard` (Streamlit) | serviço no `docker-compose.yml`, porta 8501 (só rede interna) | Roda o painel; sobe junto com a stack |
 | `supabase-auth` (GoTrue) | serviço no `docker-compose.yml`, porta 9999 | API de autenticação: login, tokens de sessão, `/admin/users` |
 | `supabase-db` (Postgres) | serviço no `docker-compose.yml`, sem porta no host | Banco só do GoTrue (usuários e sessões) |
 | `docker/supabase-init.sql` | roda no 1º boot do `supabase-db` | Cria o schema `auth` que o GoTrue espera |
@@ -518,15 +535,14 @@ São **dois** arquivos (ambos no `.gitignore`; copie dos `.example`). Gere cada 
 cp .env.example .env
 cp streamlit_test_jupyter/vars.env.example streamlit_test_jupyter/vars.env
 
-# 2. Suba a stack — inclui supabase-db e supabase-auth
+# 2. Suba a stack — inclui supabase-db, supabase-auth e o dashboard
 docker compose up -d
 
 # 3. Confirme que o GoTrue respondeu
 curl -sf http://localhost:9999/health && echo " GoTrue OK"
 
-# 4. Rode o dashboard (cria o usuário master no primeiro boot)
-docker compose exec -w /workspace/streamlit spark \
-  streamlit run app.py --server.port 8501 --server.address 0.0.0.0
+# 4. O dashboard já subiu como serviço (cria o usuário master no primeiro boot)
+docker compose logs -f dashboard
 ```
 
 5. Acesse <https://dashboard.localhost> e entre com `AUTH_MASTER_EMAIL` / `AUTH_MASTER_PASSWORD`.
@@ -614,7 +630,7 @@ materializar. Nesse caso a fonte é criada na UI do Dremio e o Streamlit já a e
 ---
 ## Imagem do Spark/Jupyter
 
-O serviço `spark` roda uma imagem própria, construída a partir de
+Os serviços `spark` e `dashboard` rodam a **mesma** imagem própria, construída a partir de
 [`docker/spark/Dockerfile`](docker/spark/Dockerfile). As bibliotecas ficam **dentro da imagem**, não
 num `pip install` de entrypoint — que atrasaria todo boot e se perderia a cada recriação do
 container.
@@ -624,6 +640,10 @@ docker compose build spark          # construir (a primeira vez leva alguns minu
 docker compose up -d spark
 docker compose build --no-cache spark   # reconstruir do zero
 ```
+
+Como a imagem é compartilhada, construir o `spark` já deixa o `dashboard` pronto — o que muda entre
+os dois é só o entrypoint (Jupyter/Spark de um lado, `streamlit run app.py` do outro). Depois de
+reconstruir, recrie os dois: `docker compose up -d spark dashboard`.
 
 Para adicionar bibliotecas, edite [`docker/spark/requirements.txt`](docker/spark/requirements.txt) e
 reconstrua. Não use `!pip install` na célula do notebook a não ser para teste rápido: some quando o
@@ -763,7 +783,7 @@ redirecionado para HTTPS.
 
 | Interface | URL (via proxy) | Backend |
 |---|---|---|
-| Dashboard (Streamlit) | `https://dashboard.localhost` | spark:8501 |
+| Dashboard (Streamlit) | `https://dashboard.localhost` | dashboard:8501 |
 | Dremio (UI + REST) | `https://dremio.localhost` | dremio:9047 |
 | MinIO (console) | `https://minio.localhost` | minio:9001 |
 | JupyterLab (exige `JUPYTER_TOKEN`) | `https://jupyter.localhost` | spark:8888 |
@@ -780,6 +800,7 @@ depuração local, ou ficam apenas na rede interna do Docker:
 | Nessie REST | `127.0.0.1:19120` | `/api/v2` (sem auth — por isso loopback) |
 | Supabase GoTrue | `127.0.0.1:9999` | API de autenticação |
 | PostgreSQL / MongoDB | `127.0.0.1:5435` / `127.0.0.1:27017` | bancos de origem |
+| `dashboard` (Streamlit) | só rede interna, `dashboard:8501` | painel; acesso só pelo proxy |
 | `supabase-db`, Spark 7077, Dremio 45678 | só rede interna | não publicam no host |
 
 Dentro da rede Docker os serviços se falam pelo nome (`dremio:9047`, `minio:9000`, `nessie:19120`,
@@ -817,6 +838,7 @@ Ambiente de referência: Docker 29.6.1, Compose v5.3.0, kernel Linux 7.0, x86_64
 | Dremio: join entre tabela Iceberg e Postgres | ✅ |
 | GoTrue: 54 migrações aplicadas; `/health` OK; master criado no 1º boot | ✅ |
 | Streamlit: login Supabase + sessão em cookie + Arrow Flight (`:32010`) + query federada | ✅ |
+| Serviço `dashboard` sobe no `docker compose up -d`, fica `healthy` e responde em `https://dashboard.localhost` | ✅ |
 | Auth: signup público bloqueado; master cria/remove visualizador; visualizador entra sem ser admin | ✅ |
 | Notebooks-modelo executados de ponta a ponta (`nbconvert --execute`) | ✅ |
 | Pipeline completo: PostgreSQL/CSV/JSON → `coleta` → `limpeza` → `refinamento` → Streamlit | ✅ |
@@ -894,13 +916,14 @@ dremio-spark-minio/
 │   ├── notebook-seed/    # arquivos montados no container do Spark
 │   └── postgres/         # 001_init.sql — roda no primeiro boot do Postgres
 └── streamlit_test_jupyter/
-    ├── app.py            # dashboard Streamlit via Arrow Flight
+    ├── app.py            # entrada do painel (serviço `dashboard`) via Arrow Flight
+    ├── app_semarh/       # o painel em si (uma aba por área)
     ├── auth/             # autenticação Supabase do dashboard
     │   ├── authentication.py   # require_auth(): login, sessão, painel do master
     │   ├── supabase_client.py  # cliente GoTrue + Admin API
     │   ├── session.py          # normaliza, renova e valida a sessão
     │   └── cookies.py          # cookie de sessão criptografado
-    ├── run.ipynb
+    ├── run.ipynb        # legado: o painel agora sobe pelo serviço `dashboard`
     ├── vars.env         # Dremio + Supabase + master — NÃO versionar
     └── vars.env.example # template versionável do vars.env
 ```

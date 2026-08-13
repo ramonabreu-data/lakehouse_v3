@@ -4,10 +4,13 @@ Responsabilidade minima: carregar config, aplicar o gate de autenticacao e
 delegar todo o resto para o pacote `app_semarh` (uma aba por area). Toda a
 logica do painel vive em `app_semarh/`.
 
-Rode de dentro do container do Spark:
+Sobe sozinho com a stack: e o servico `dashboard` do docker-compose.yml
+(mesma imagem do spark, entrypoint `streamlit run app.py` na porta 8501).
+Nao precisa rodar nada a mao.
 
-    docker compose exec -w /workspace/streamlit spark \
-      streamlit run app.py --server.port 8501 --server.address 0.0.0.0
+    docker compose up -d dashboard     # subir
+    docker compose restart dashboard   # aplicar vars.env
+    docker compose logs -f dashboard   # log
 
 Acesse https://dashboard.localhost (via proxy).
 """
