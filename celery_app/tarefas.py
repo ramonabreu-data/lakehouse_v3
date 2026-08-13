@@ -54,6 +54,9 @@ ARQUIVO_ESTADO = Path(os.getenv("ARQUIVO_ESTADO", "/estado/atualizacao.json"))
 ARQUIVO_HISTORICO = Path(os.getenv("ARQUIVO_HISTORICO", "/estado/historico.jsonl"))
 # Nome amigavel do dataset de origem, so para a mensagem.
 DATASET = os.getenv("DATASET_ORIGEM", "sermarh_painel/selo_ambiental_2026.parquet")
+# Zonas do object store, so para dizer ONDE cada coisa mora na mensagem.
+ZONA_ENTRADA = os.getenv("ZONA_ENTRADA", "entrada")
+ZONA_ARMAZEM = os.getenv("ZONA_ARMAZEM", "armazem")
 VARS_ENV = Path(os.getenv("VARS_ENV", "/opt/painel/vars.env"))
 # Fonte bruta no Dremio (o parquet da zona de entrada, promovido como dataset).
 FONTE_BRUTA = os.getenv(
@@ -163,6 +166,43 @@ def _ler_manifesto(caminho: Path) -> list[dict]:
     return sorted(tabelas.values(), key=lambda r: r["tabela"])
 
 
+def _mensagem(estado: dict, anteriores: dict[str, int]) -> str:
+    """Aviso do Telegram: o que foi publicado, ONDE mora e o que variou.
+
+    "Onde" importa porque o mesmo dado aparece em três lugares com nomes
+    diferentes: o arquivo no MinIO, a tabela Iceberg no catálogo Nessie e o
+    caminho pelo qual o Dremio a serve.
+    """
+    partes = [
+        "🟢 <b>Dados atualizados</b>",
+        _por_extenso(estado["atualizado_em"]),
+        "",
+        f"📥 <b>Origem</b> — MinIO, zona <code>{ZONA_ENTRADA}</code>",
+        f"<code>{html.escape(DATASET)}</code>"
+        + (f" — {estado['linhas_origem']} linhas" if estado.get("linhas_origem") else ""),
+        f"no Dremio: <code>{html.escape(FONTE_BRUTA)}</code>",
+        "",
+        f"📦 <b>Tabelas reescritas</b> — Iceberg na zona <code>{ZONA_ARMAZEM}</code> do MinIO, "
+        "catálogo Nessie:",
+    ]
+    for tabela in estado.get("tabelas") or []:
+        antes = anteriores.get(tabela["tabela"])
+        delta = ""
+        if antes is not None and antes != tabela["linhas"]:
+            delta = f" ({tabela['linhas'] - antes:+d})"
+        partes.append(f"• <code>{html.escape(tabela['tabela'])}</code> — {tabela['linhas']} linhas{delta}")
+    if not estado.get("tabelas"):
+        partes.append("(nenhuma tabela publicada)")
+    partes.append(
+        "\n<i>Toda carga reescreve as tabelas por inteiro; o número entre parênteses é a "
+        "variação de linhas desde a carga anterior.</i>"
+    )
+    if estado.get("novidades"):
+        partes.append("\n🔎 <b>Novidades no ambiente:</b>")
+        partes += [f"• {html.escape(n)}" for n in estado["novidades"]]
+    return "\n".join(partes)
+
+
 @app.task(name="painel.atualizar", bind=True)
 def atualizar(self, forcar: bool = False) -> dict:
     """Refaz dataset -> tabelas refinadas -> carimbo para o dashboard.
@@ -240,12 +280,17 @@ def atualizar(self, forcar: bool = False) -> dict:
 
     # 3. confere e carimba — o carimbo e a chave de cache do dashboard.
     progresso(92, "Conferindo as tabelas publicadas")
-    linhas = None
+    linhas = linhas_origem = None
     try:
-        linhas = int(_conexao_dremio().toPandas(f"SELECT COUNT(*) AS n FROM {TABELA_CONFERE}")["n"][0])
+        conexao = _conexao_dremio()
+        linhas = int(conexao.toPandas(f"SELECT COUNT(*) AS n FROM {TABELA_CONFERE}")["n"][0])
+        linhas_origem = int(conexao.toPandas(f"SELECT COUNT(*) AS n FROM {FONTE_BRUTA}")["n"][0])
         etapas["conferencia"] = "ok"
     except Exception as erro:
         etapas["conferencia"] = f"falhou: {erro}"[:300]
+
+    # Linhas de cada tabela na carga anterior — vira a variacao na mensagem.
+    anteriores = {t["tabela"]: t["linhas"] for t in (_ler_estado().get("tabelas") or [])}
 
     # 4. varredura do ambiente: o que mudou no Dremio e no MinIO desde a carga
     # anterior — inclusive coisa criada por fora do pipeline.
@@ -267,6 +312,7 @@ def atualizar(self, forcar: bool = False) -> dict:
         "dataset": DATASET,
         "tabelas": tabelas,
         "linhas": linhas,
+        "linhas_origem": linhas_origem,
         "origem": "manual" if forcar else "automática",
         "hora_agendada": HORA_ATUALIZACAO,
         "fuso": str(FUSO),
@@ -279,18 +325,7 @@ def atualizar(self, forcar: bool = False) -> dict:
     _gravar_estado({**estado, "inventario": foto})
     _registrar_historico(estado)
 
-    # Mensagem curta: o que foi publicado, o que mudou no ambiente e quando.
-    linhas_msg = [
-        "🟢 <b>Dados atualizados</b>",
-        f"{_por_extenso(estado['atualizado_em'])}",
-        f"Dataset: <code>{html.escape(DATASET)}</code>",
-    ]
-    linhas_msg += [f"• <code>{html.escape(t['tabela'])}</code> — {t['linhas']} linhas"
-                   for t in tabelas] or ["(nenhuma tabela publicada)"]
-    if novidades:
-        linhas_msg.append("\n<b>Novidades no ambiente:</b>")
-        linhas_msg += [f"• {html.escape(n)}" for n in novidades]
-    notificacao.enviar("\n".join(linhas_msg), evento="sucesso")
+    notificacao.enviar(_mensagem(estado, anteriores), evento="sucesso")
 
     log.info("painel atualizado: %s", estado)
     return estado

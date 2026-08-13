@@ -3,7 +3,9 @@
 Credenciais vêm **só do ambiente** (`.env` da stack, que está no `.gitignore`):
 
     TELEGRAM_BOT_TOKEN   token do BotFather
-    TELEGRAM_CHAT_ID     id do grupo (negativo) ou da conversa privada
+    TELEGRAM_CHAT_ID     id do grupo (negativo) ou da conversa privada. Aceita
+                         vários separados por vírgula e, em grupo com tópicos,
+                         `chat:topico`
     TELEGRAM_NOTIFICAR   `sucesso` (padrão), `falha` ou `tudo`/`nada`
 
 Sem token ou sem chat, o envio vira no-op silencioso — a atualização não falha
@@ -33,8 +35,25 @@ def _token() -> str:
     return os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
 
-def _chat() -> str:
-    return os.getenv("TELEGRAM_CHAT_ID", "").strip()
+def _chats() -> list[tuple[str, int | None]]:
+    """Destinos configurados: `(chat_id, tópico)`.
+
+    `TELEGRAM_CHAT_ID` aceita mais de um destino separado por vírgula — dá para
+    avisar no grupo e no privado ao mesmo tempo. Em grupo com tópicos (fórum),
+    use `chat:topico`, por exemplo `-1002...:12`.
+    """
+    destinos = []
+    for bruto in os.getenv("TELEGRAM_CHAT_ID", "").split(","):
+        bruto = bruto.strip()
+        if not bruto:
+            continue
+        # o id do chat pode comecar com "-": so o ULTIMO ":" separa o topico
+        if ":" in bruto:
+            chat, _, topico = bruto.rpartition(":")
+            destinos.append((chat.strip(), int(topico)))
+        else:
+            destinos.append((bruto, None))
+    return destinos
 
 
 def _quando_notificar() -> str:
@@ -43,7 +62,7 @@ def _quando_notificar() -> str:
 
 def ativo(evento: str = "sucesso") -> bool:
     """Ha credencial e este tipo de evento deve ser notificado?"""
-    if not (_token() and _chat()):
+    if not (_token() and _chats()):
         return False
     escolha = _quando_notificar()
     if escolha in ("nada", "off", "false"):
@@ -61,16 +80,25 @@ def _chamar(metodo: str, **dados) -> dict:
 
 
 def enviar(texto: str, evento: str = "sucesso") -> bool:
-    """Manda a mensagem. Devolve False (sem levantar) se nao der para enviar."""
+    """Manda a mensagem a todos os destinos configurados.
+
+    Devolve True se ao menos um recebeu. Um destino com problema (bot removido
+    do grupo, id errado) nao impede os outros nem derruba a atualizacao.
+    """
     if not ativo(evento):
         return False
-    try:
-        _chamar("sendMessage", chat_id=_chat(), text=texto,
-                parse_mode="HTML", disable_web_page_preview=True)
-        return True
-    except Exception as erro:
-        log.warning("não foi possível notificar no Telegram: %s", erro)
-        return False
+    entregues = 0
+    for chat, topico in _chats():
+        dados = {"chat_id": chat, "text": texto,
+                 "parse_mode": "HTML", "disable_web_page_preview": True}
+        if topico is not None:
+            dados["message_thread_id"] = topico
+        try:
+            _chamar("sendMessage", **dados)
+            entregues += 1
+        except Exception as erro:
+            log.warning("não foi possível notificar %s no Telegram: %s", chat, erro)
+    return entregues > 0
 
 
 def identidade() -> dict:
@@ -112,4 +140,8 @@ if __name__ == "__main__":  # pequena CLI de diagnostico
     else:
         bot = identidade()
         print(f"bot @{bot['username']} ({bot['first_name']}) — token válido")
-        print(f"chat configurado: {_chat() or '(vazio — rode --descobrir)'}")
+        destinos = _chats()
+        if not destinos:
+            print("nenhum destino configurado — rode --descobrir")
+        for chat, topico in destinos:
+            print(f"  destino: {chat}" + (f" (tópico {topico})" if topico else ""))

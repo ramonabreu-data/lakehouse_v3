@@ -615,13 +615,29 @@ Toda carga — automática ou manual — gera três registros:
 
 ```
 🟢 Dados atualizados
-quinta, 13/08/2026 às 12:16
-Dataset: sermarh_painel/selo_ambiental_2026.parquet
+quinta, 13/08/2026 às 13:07
+
+📥 Origem — MinIO, zona entrada
+sermarh_painel/selo_ambiental_2026.parquet — 224 linhas
+no Dremio: minio.entrada."sermarh_painel"."selo_ambiental_2026.parquet"
+
+📦 Tabelas reescritas — Iceberg na zona armazem do MinIO, catálogo Nessie:
 • nessie.refinamento.semarh_painel — 224 linhas
 • nessie.refinamento.semarh_painel_fases — 672 linhas
 • nessie.refinamento.semarh_painel_por_criterios — 11 linhas
 • nessie.refinamento.semarh_painel_por_selo — 5 linhas
+
+Toda carga reescreve as tabelas por inteiro; o número entre parênteses é a
+variação de linhas desde a carga anterior.
 ```
+
+Cada bloco diz **onde o dado mora**: o arquivo de origem fica no MinIO (zona `entrada`) e é servido
+pelo Dremio com outro nome; as tabelas são Iceberg na zona `armazem`, catalogadas no Nessie e
+consultadas no Dremio como `nessie.refinamento.*`. As tabelas listadas foram **reescritas naquela
+execução** — o manifesto é criado, lido e apagado a cada carga, então nada ali é herança de execução
+anterior. Como a gravação é integral (`createOrReplace`), elas são reescritas mesmo quando o
+conteúdo não muda; é por isso que o bucket `armazem` cresce alguns arquivos Iceberg a cada carga, e
+é a variação entre parênteses que diz se o conteúdo mudou de tamanho.
 
 Além do que a carga publica, cada execução faz uma **varredura do ambiente** e avisa o que mudou
 desde a carga anterior — inclusive coisa criada por fora do pipeline:
@@ -658,10 +674,19 @@ Falha também notifica (🔴), com o fim do log do notebook. Configure no `.env`
 | Variável | Para quê |
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | Token do BotFather |
-| `TELEGRAM_CHAT_ID` | Id do grupo (negativo) ou da conversa |
+| `TELEGRAM_CHAT_ID` | Id do grupo (negativo) ou da conversa. Vários, separados por vírgula; em grupo com tópicos, `chat:topico` |
 | `TELEGRAM_NOTIFICAR` | `tudo` (padrão), `sucesso`, `falha` ou `nada` |
 
-Para achar o id do grupo: adicione o bot ao grupo, mande qualquer mensagem lá e rode
+**Para avisar num grupo:**
+
+1. Adicione **o bot ao grupo**.
+2. Mande uma mensagem no grupo que ele consiga ver — por padrão o Telegram liga o *modo privacidade*
+   e o bot só enxerga mensagens que começam com `/` ou que o mencionem. Um `/start@seu_bot` resolve;
+   promovê-lo a administrador também.
+3. Rode o `--descobrir`: o grupo aparece com id **negativo** (`-100…` em supergrupo).
+4. Ponha o id no `TELEGRAM_CHAT_ID`, `docker compose up -d celery-worker` e confirme com `--teste`.
+
+Para achar o id: adicione o bot ao destino, mande uma mensagem lá e rode
 
 ```bash
 docker compose exec celery-worker python3 -m celery_app.notificacao --descobrir   # lista os chats
