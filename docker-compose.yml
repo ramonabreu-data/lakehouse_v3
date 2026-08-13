@@ -173,6 +173,17 @@ services:
       - ZONA_ARMAZEM=${ZONA_ARMAZEM}
       - ZONA_ENTRADA=${ZONA_ENTRADA}
       - ZONA_HISTORICO=${ZONA_HISTORICO}
+      # Varredura do ambiente: le o catalogo do Postgres direto do banco (o
+      # Dremio so revalida o dele no ciclo de metadados, de 1h por padrao).
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      # Observabilidade: aviso no Telegram a cada carga. Token e chat vem do
+      # .env (fora do versionamento); sem eles o envio e um no-op silencioso.
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - TELEGRAM_NOTIFICAR=${TELEGRAM_NOTIFICAR:-tudo}
     volumes:
       - ./celery_app:/workspace/celery_app
       - ./notebooks:/workspace/notebooks

@@ -4,6 +4,14 @@ Stack local de Data Lakehouse, pronta para ser implantada em qualquer projeto: a
 object store (MinIO), processamento distribuído (Spark), catálogo Iceberg com versionamento tipo git
 (Nessie), query engine federada (Dremio) e bancos de origem (PostgreSQL e MongoDB).
 
+Em cima dessa base rodam três camadas, todas subindo com um `docker compose up -d`:
+
+| Camada | O que é |
+|---|---|
+| **Lakehouse** | MinIO + Spark + Nessie + Dremio, com as zonas `entrada` / `armazem` / `historico` |
+| **Painel** | app Streamlit com login, servido por HTTPS pelo proxy — hoje com o BI do Selo Ambiental 2026 |
+| **Automação** | Celery: recarrega o dado todo dia às 7h, varre o ambiente e avisa no Telegram |
+
 Toda a identidade da implantação — nome do projeto, prefixo de containers e volumes, nomes das zonas
 de armazenamento e credenciais — vem do arquivo `.env`. O `docker-compose.yml` é genérico e não
 precisa ser editado para atender um novo cliente.
@@ -21,13 +29,14 @@ precisa ser editado para atender um novo cliente.
 4. [Passo a passo](#passo-a-passo)
 5. [Atualização automática (Celery)](#atualização-automática-celery)
 6. [Autenticação do dashboard](#autenticação-do-dashboard)
-7. [Notebooks-modelo](#notebooks-modelo)
-8. [Imagem do Spark/Jupyter](#imagem-do-sparkjupyter)
-9. [Zonas do object store](#zonas-do-object-store)
-10. [Portas e endereços](#portas-e-endereços)
-11. [Validação de ponta a ponta](#validação-de-ponta-a-ponta)
-12. [Segurança](#segurança)
-13. [Estrutura do repositório](#estrutura-do-repositório)
+7. [Painel SEMARH](#painel-semarh)
+8. [Notebooks-modelo](#notebooks-modelo)
+9. [Imagem do Spark/Jupyter](#imagem-do-sparkjupyter)
+10. [Zonas do object store](#zonas-do-object-store)
+11. [Portas e endereços](#portas-e-endereços)
+12. [Validação de ponta a ponta](#validação-de-ponta-a-ponta)
+13. [Segurança](#segurança)
+14. [Estrutura do repositório](#estrutura-do-repositório)
 
 ---
 
@@ -81,6 +90,21 @@ flowchart LR
     WRK -.->|carimbo de atualização| STL
 ```
 
+### Os 13 serviços
+
+| Serviço | Papel | Publicado |
+|---|---|---|
+| `caddy` | Proxy reverso com TLS — **único** ponto de entrada da rede | 80/443 |
+| `dashboard` | Painel Streamlit | via proxy |
+| `dremio` | Query engine federada (UI + SQL + Arrow Flight) | via proxy / loopback |
+| `spark` | Spark + JupyterLab (escrita Iceberg, notebooks) | via proxy / loopback |
+| `minio` | Object store (as três zonas) | via proxy / loopback |
+| `nessie` | Catálogo Iceberg versionado | loopback |
+| `postgres` · `mongo` | Bancos de origem | loopback |
+| `supabase-auth` · `supabase-db` | Login do painel (GoTrue + banco próprio) | loopback |
+| `redis` | Fila do Celery | rede interna |
+| `celery-beat` · `celery-worker` | Agenda e executa a atualização diária | rede interna |
+
 Os serviços ficam numa rede Docker chamada `interna` (que o Compose publica como
 `${PROJETO}_interna`). **Dentro** dessa rede eles se enxergam pelo nome do serviço —
 `minio:9000`, `nessie:19120`, `dremio:9047`, `supabase-auth:9999`. **De fora**, o único ponto de
@@ -95,7 +119,7 @@ demais serviços só publicam em `127.0.0.1`. Ver [Portas e endereços](#portas-
 |---|---|---|
 | Docker Engine | 24+ | validado com 29.6.1 |
 | Docker Compose | v2+ | validado com v5.3.0 |
-| RAM livre | **8 GB** (12 GB confortável) | o Dremio sozinho quer ~4 GB; Spark + Jupyter mais 2–3 GB |
+| RAM livre | **8 GB** (12 GB confortável) | Dremio ~4 GB; Spark + Jupyter 2–3 GB; a carga diária sobe um driver Spark de ~1 GB por ~1,5 min |
 | Disco livre | ~15 GB | as imagens somam ~8 GB |
 | CPU | x86_64 com AVX | obrigatório para MongoDB 5.0+ |
 | Kernel Linux | qualquer | **se ≥ 6.19, use `mongo:7.0`** — o MongoDB 8.x não sobe em kernel ≥ 6.19 |
@@ -239,8 +263,13 @@ curl -sf  http://localhost:9999/health             && echo "GoTrue  OK"
 curl -skf -o /dev/null https://dashboard.localhost  && echo "Painel  OK (via proxy)"
 ```
 
+```bash
+docker compose exec redis redis-cli ping                            # PONG
+docker compose exec celery-worker celery -A celery_app.tarefas inspect ping   # 1 node online
+```
+
 Todos os containers devem aparecer `Up` em `docker compose ps`; `dashboard`, `minio`, `postgres`,
-`supabase-db` e `supabase-auth` têm healthcheck e ficam `Up (healthy)`. O `dashboard` espera o
+`redis`, `supabase-db` e `supabase-auth` têm healthcheck e ficam `Up (healthy)`. O `dashboard` espera o
 `supabase-auth` ficar saudável antes de iniciar, então leva alguns segundos a mais que os demais.
 
 O Dremio leva **1 a 3 minutos** no primeiro boot. Acompanhe com `docker compose logs -f dremio`.
@@ -453,7 +482,7 @@ COOKIE_SECRET=<32+ caracteres>
 
 Os endpoints usam nomes de serviço porque o app roda **dentro** da rede Docker. Os serviços de
 autenticação (`supabase-db`, `supabase-auth`) já sobem com o `docker compose up -d` do passo 2.
-Ajuste a query em `app.py` para um dataset que exista no seu Dremio.
+As consultas ficam em `app_semarh/` — ver [Painel SEMARH](#painel-semarh).
 
 O painel **sobe sozinho** junto com a stack: é o serviço `dashboard`, iniciado pelo
 `docker compose up -d` do passo 2 e reiniciado automaticamente (`restart: unless-stopped`). Não é
@@ -527,10 +556,80 @@ parênteses:
 🕒 Atualizado em: quinta, 13/08/2026 às 11:31 (manual)
 ```
 
+### Observabilidade: aviso no Telegram + histórico
+
+Toda carga — automática ou manual — gera três registros:
+
+1. **`/estado/atualizacao.json`** — a última carga (quando, origem, duração, dataset de origem e as
+   tabelas publicadas com a contagem de linhas). É o que o painel lê para o `🕒 Atualizado em`.
+2. **`/estado/historico.jsonl`** — uma linha por execução, append-only. Aparece na sidebar em
+   **Histórico**: quando · situação · origem · tabelas atualizadas.
+3. **Mensagem no Telegram** — curta, só o que foi publicado:
+
+```
+🟢 Dados atualizados
+quinta, 13/08/2026 às 12:16
+Dataset: sermarh_painel/selo_ambiental_2026.parquet
+• nessie.refinamento.semarh_painel — 224 linhas
+• nessie.refinamento.semarh_painel_fases — 672 linhas
+• nessie.refinamento.semarh_painel_por_criterios — 11 linhas
+• nessie.refinamento.semarh_painel_por_selo — 5 linhas
+```
+
+Além do que a carga publica, cada execução faz uma **varredura do ambiente** e avisa o que mudou
+desde a carga anterior — inclusive coisa criada por fora do pipeline:
+
+| Onde | O que é comparado | Como é lido |
+|---|---|---|
+| **Dremio** | sources, spaces, pastas e todos os datasets | `INFORMATION_SCHEMA` (esquemas + tabelas/views) |
+| **PostgreSQL** da stack | tabelas e views de todos os schemas | direto do `information_schema` do banco |
+| **MinIO** | todos os buckets: arquivos e tamanho | API S3, listando bucket a bucket |
+
+```
+Novidades no ambiente:
+• Dremio: +1 fonte/space — novo_source
+• postgres: +1 tabela(s) — public.pedidos_2027
+• MinIO `entrada`: +1 arquivo(s) — carga_marco.parquet
+```
+
+Duas decisões que evitam ruído:
+
+- O PostgreSQL é lido **direto do banco**, não pelo Dremio: o Dremio revalida o catálogo das fontes
+  no ciclo de metadados dele (1 h por padrão), então uma tabela criada agora demoraria a aparecer.
+  Fontes externas (como `siga`) só aparecem pelo catálogo do Dremio, no ritmo dele.
+- O **MongoDB** não entra na varredura direta (o cliente Python não está na imagem): coleções novas
+  aparecem pelo catálogo do Dremio, no ciclo de metadados dele.
+- O bucket do **armazém** entra só pelo agregado (`+18 arquivos, agora 518`): ali estão os arquivos
+  internos do Iceberg, com nomes de uuid — listar um a um encheria a mensagem a cada commit.
+
+A lista de tabelas **não é fixa no código**: `lakehouse.gravar()` anota cada tabela publicada num
+manifesto da execução (`MANIFESTO_PUBLICACAO`), e a tarefa lê esse manifesto. Qualquer notebook do
+pipeline que grave com o helper entra no aviso automaticamente — sem tocar no serviço.
+
+Falha também notifica (🔴), com o fim do log do notebook. Configure no `.env` — **nunca no código**:
+
+| Variável | Para quê |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | Token do BotFather |
+| `TELEGRAM_CHAT_ID` | Id do grupo (negativo) ou da conversa |
+| `TELEGRAM_NOTIFICAR` | `tudo` (padrão), `sucesso`, `falha` ou `nada` |
+
+Para achar o id do grupo: adicione o bot ao grupo, mande qualquer mensagem lá e rode
+
+```bash
+docker compose exec celery-worker python3 -m celery_app.notificacao --descobrir   # lista os chats
+docker compose exec celery-worker python3 -m celery_app.notificacao --teste       # envia um teste
+docker compose exec celery-worker python3 -m celery_app.notificacao               # valida o token
+```
+
+Sem token ou sem chat, o envio é um **no-op silencioso**: a atualização não falha por causa da
+notificação, e o histórico continua sendo gravado.
+
 ```bash
 docker compose logs -f celery-worker                                  # acompanhar
 docker compose exec celery-worker celery -A celery_app.tarefas call painel.atualizar   # rodar agora
 docker compose exec celery-worker cat /estado/atualizacao.json        # último resultado
+docker compose exec celery-worker tail -3 /estado/historico.jsonl      # histórico
 ```
 
 > **Memória**: cada execução sobe um driver Spark (~1,5 min, ~1 GB). Em máquina apertada, evite
@@ -617,6 +716,58 @@ docker compose logs -f dashboard
 
 ---
 
+---
+
+## Painel SEMARH
+
+O app Streamlit tem dois níveis de navegação, ambos espelhados na URL: **áreas** (botões na
+sidebar, `?setor=`) e **BIs** da área (abas, `?bi=`). Para acrescentar um BI, escreva um módulo em
+`app_semarh/bis/` com uma função `render(user)` e registre-o na lista do setor em
+[`app_semarh/setores.py`](streamlit_test_jupyter/app_semarh/setores.py) — o resto da navegação sai
+de graça.
+
+### BI Selo Ambiental 2026
+
+Lê `nessie.refinamento.semarh_painel_fases` (grão: 1 linha por município × fase) e tem quatro
+visões, na mesma nomenclatura do painel da SEMARH no Looker Studio:
+
+| Visão | O que mostra |
+|---|---|
+| 1ª / 2ª / 3ª fase | Cartões, distribuição por selo e por critérios, mapa e tabela daquela fase |
+| Balanço anual | Os três funis lado a lado + tabela com resultado e pontos das três fases |
+
+A **3ª fase é o padrão** — é o resultado final da edição. As fases 1 e 2 são parciais; a **1ª fase é
+a publicada no painel antigo**, então é nela que os números batem com o Looker Studio (cartões,
+barras e tabela conferem indicador por indicador).
+
+O que o painel faz além do espelhamento:
+
+- **Filtros** por território, situação e **município** (vazio = todos), persistidos na URL — dá para
+  mandar o link já filtrado.
+- **Clique nas barras** de "tipo de selo" ou "critérios atendidos" recorta o mapa e a tabela; os dois
+  gráficos combinam em E. Trocar de fase ou de filtro limpa a seleção.
+- **Mapa** com o Piauí inteiro sempre enquadrado (o zoom não pula ao filtrar), círculo proporcional
+  à pontuação e cor por parâmetro escolhido: resultado, território, critérios, pontuação ou pacto
+  ambiental.
+- **Rodapé** com a data da última carga e, na sidebar, o botão de atualizar na hora.
+
+### Duas coisas que o dado ensina
+
+**O selo sai do número de critérios, não da pontuação.** A regra da edição 2026 — conferida nas três
+fases — é `0–2 → não elegível · 3 → Selo C · 4–5 → Selo B · 6+ → Selo A`. As pontuações se
+sobrepõem: há Selo C com mais pontos que Selo A. Por isso a tabela mostra critérios ao lado dos
+pontos, e as barras de critérios saem na cor do selo que aquela faixa produz. O painel **deriva a
+regra do próprio dado** (resultado predominante de cada quantidade de critérios), então ela
+acompanha se a edição mudar.
+
+**A chave do município é o código IBGE, não o nome.** A coluna `cod_ibge` (do campo `aux4` da fonte)
+é o código sem o prefixo do estado — `2200000 + cod_ibge`. O nome não serve: a dimensão da casa
+grava `Nazária do Piauí` onde a fonte grava `Nazária`.
+
+O refinamento também corrige uma ambiguidade da origem: município **não habilitado fica sem
+apuração** (`NULL`), não com `0` critérios. No gráfico de critérios, porém, esses municípios entram
+no balde `0` para bater com o painel de origem — a legenda abaixo do gráfico diz quantos são.
+
 ## Notebooks-modelo
 
 A pasta `notebooks/` traz modelos prontos para conectar fontes externas, tratar os dados e
@@ -646,6 +797,12 @@ entregá-los ao Streamlit. Ela é montada no container, então o que você edita
 | `lakehouse.py` | Módulo comum: sessão Spark, leitura, escrita, perfil |
 
 Detalhes de uso em [`notebooks/README.md`](notebooks/README.md).
+
+Além dos modelos, `notebooks/semarh_painel/refinamento_selo_ambiental.ipynb` é o pipeline **em
+produção** do painel: lê o parquet da zona de entrada, refina as três fases da edição e publica
+`refinamento.semarh_painel`, `..._fases` e os dois resumos. É o mesmo notebook que o serviço de
+[atualização automática](#atualização-automática-celery) reexecuta — não há lógica duplicada entre
+o que a pessoa roda no JupyterLab e o que o robô roda às 7h.
 
 ### As três camadas
 
@@ -678,6 +835,11 @@ gravar(df, "coleta.pedidos")     # tabela Iceberg no catálogo
 As versões de Iceberg e das extensões Nessie estão fixadas ali com o motivo ao lado — não mexa sem
 necessidade.
 
+`gravar()` também anota a tabela e a contagem de linhas no manifesto da execução quando a variável
+`MANIFESTO_PUBLICACAO` existe — é assim que a [notificação](#observabilidade-aviso-no-telegram--histórico)
+sabe o que foi publicado sem ninguém listar tabela na mão. Fora do serviço de atualização a variável
+não existe e o registro é ignorado.
+
 ### Fontes além das quatro
 
 `ler_jdbc` serve para qualquer banco cujo driver você adicione:
@@ -696,8 +858,8 @@ materializar. Nesse caso a fonte é criada na UI do Dremio e o Streamlit já a e
 ---
 ## Imagem do Spark/Jupyter
 
-Os serviços `spark` e `dashboard` rodam a **mesma** imagem própria, construída a partir de
-[`docker/spark/Dockerfile`](docker/spark/Dockerfile). As bibliotecas ficam **dentro da imagem**, não
+Quatro serviços rodam a **mesma** imagem própria — `spark`, `dashboard`, `celery-worker` e
+`celery-beat` —, construída a partir de [`docker/spark/Dockerfile`](docker/spark/Dockerfile). As bibliotecas ficam **dentro da imagem**, não
 num `pip install` de entrypoint — que atrasaria todo boot e se perderia a cada recriação do
 container.
 
@@ -707,9 +869,15 @@ docker compose up -d spark
 docker compose build --no-cache spark   # reconstruir do zero
 ```
 
-Como a imagem é compartilhada, construir o `spark` já deixa o `dashboard` pronto — o que muda entre
-os dois é só o entrypoint (Jupyter/Spark de um lado, `streamlit run app.py` do outro). Depois de
-reconstruir, recrie os dois: `docker compose up -d spark dashboard`.
+Como a imagem é compartilhada, construir o `spark` já deixa os outros três prontos — o que muda é só
+o entrypoint (Jupyter/Spark, `streamlit run`, `celery worker`, `celery beat`). Depois de reconstruir,
+recrie todos: `docker compose up -d spark dashboard celery-worker celery-beat`.
+
+O Celery entra numa **camada própria no fim do Dockerfile**, não no `requirements.txt`: assim mexer
+nele não invalida o cache do `pip` pesado e o rebuild leva segundos.
+
+> Editar código em `celery_app/` (bind mount) **não** basta: o processo já importou o módulo. Use
+> `docker compose restart celery-worker` — um `up -d` sem mudança no serviço não recria o container.
 
 Para adicionar bibliotecas, edite [`docker/spark/requirements.txt`](docker/spark/requirements.txt) e
 reconstrua. Não use `!pip install` na célula do notebook a não ser para teste rápido: some quando o
@@ -908,9 +1076,13 @@ Ambiente de referência: Docker 29.6.1, Compose v5.3.0, kernel Linux 7.0, x86_64
 | Serviço `dashboard` sobe no `docker compose up -d`, fica `healthy` e responde em `https://dashboard.localhost` | ✅ |
 | Celery: worker + beat sobem com a stack; carga diária agendada para 07:00 (America/Fortaleza) | ✅ |
 | Botão "Atualizar dados agora" na sidebar: publica a tarefa, mostra a porcentagem e atualiza o carimbo (93 s de ponta a ponta) | ✅ |
+| Observabilidade: manifesto de publicação lista as 4 tabelas com as linhas; histórico em `historico.jsonl`; Telegram entregando no chat configurado | ✅ |
+| Varredura do ambiente: detectou tabela criada/removida no Postgres e arquivo adicionado/removido no bucket, na execução seguinte | ✅ |
 | Auth: signup público bloqueado; master cria/remove visualizador; visualizador entra sem ser admin | ✅ |
 | Notebooks-modelo executados de ponta a ponta (`nbconvert --execute`) | ✅ |
 | Pipeline completo: PostgreSQL/CSV/JSON → `coleta` → `limpeza` → `refinamento` → Streamlit | ✅ |
+| Painel Selo Ambiental: 3 fases + balanço anual; a 1ª fase reproduz o painel de origem (Looker) indicador por indicador | ✅ |
+| Refinamento do Selo Ambiental: 224 municípios × 3 fases = 672 linhas, código IBGE único, sem apuração em município inabilitado | ✅ |
 | MySQL via JDBC no Spark (contra servidor externo de teste) | ✅ |
 | Imagem própria construída; verificação de import embutida no Dockerfile passa | ✅ |
 | 26 bibliotecas de DS/ML importam; `tensorflow` sem o erro de protobuf da base | ✅ |
@@ -965,7 +1137,9 @@ dremio-spark-minio/
 ├── readme.md
 ├── celery_app/                       # atualização diária (07:00) + botão manual
 │   ├── __init__.py
-│   └── tarefas.py                    # tarefa painel.atualizar (dataset → tabelas → carimbo)
+│   ├── tarefas.py                    # tarefa painel.atualizar (dataset → tabelas → carimbo)
+│   ├── notificacao.py                # aviso no Telegram (token vem do .env)
+│   └── inventario.py                 # varredura: Dremio, PostgreSQL e buckets
 ├── docker/
 │   ├── spark/                        # imagem propria do Spark/Jupyter (também roda o Celery)
 │   │   ├── Dockerfile
@@ -973,7 +1147,9 @@ dremio-spark-minio/
 │   ├── caddy/Caddyfile               # reverse proxy TLS (subdomínios + CA interna)
 │   └── supabase-init.sql             # schema `auth` do GoTrue (1º boot do supabase-db)
 ├── notebooks/                        # modelos, montados em /workspace/notebooks
-│   ├── lakehouse.py                  # módulo comum: sessão, leitura, escrita
+│   ├── lakehouse.py                  # módulo comum: sessão, leitura, escrita, manifesto
+│   ├── semarh_painel/                # pipeline em produção (não é modelo)
+│   │   └── refinamento_selo_ambiental.ipynb
 │   ├── 00_ambiente.ipynb
 │   ├── 01_origem_postgres.ipynb
 │   ├── 02_origem_mysql.ipynb
@@ -988,8 +1164,17 @@ dremio-spark-minio/
 │   ├── notebook-seed/    # arquivos montados no container do Spark
 │   └── postgres/         # 001_init.sql — roda no primeiro boot do Postgres
 └── streamlit_test_jupyter/
-    ├── app.py            # entrada do painel (serviço `dashboard`) via Arrow Flight
-    ├── app_semarh/       # o painel em si (uma aba por área)
+    ├── .streamlit/config.toml  # config do Streamlit (telemetria off, avisos de lib)
+    ├── app.py            # entrada: estilo + login + delega para app_semarh
+    ├── app_semarh/       # o painel
+    │   ├── painel.py           # navegação: áreas na sidebar, BIs em abas
+    │   ├── setores.py          # quais áreas existem e os BIs de cada uma
+    │   ├── bis/selo_ambiental.py  # BI Selo Ambiental 2026
+    │   ├── dados.py            # consulta ao Dremio + cache com carimbo
+    │   ├── filtros.py          # filtros persistidos na URL
+    │   ├── mapa.py             # enquadramento, paletas e legenda do mapa
+    │   ├── atualizacao.py      # "Atualizado em", botão manual e histórico
+    │   └── estilo.py           # CSS responsivo e molduras
     ├── auth/             # autenticação Supabase do dashboard
     │   ├── authentication.py   # require_auth(): login, sessão, painel do master
     │   ├── supabase_client.py  # cliente GoTrue + Admin API

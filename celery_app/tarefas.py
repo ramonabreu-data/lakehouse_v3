@@ -20,6 +20,7 @@ Rodar a mao (util para testar sem esperar o beat):
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import subprocess
@@ -32,6 +33,8 @@ from zoneinfo import ZoneInfo
 from celery import Celery
 from celery.schedules import crontab
 from celery.utils.log import get_task_logger
+
+from celery_app import inventario, notificacao
 
 log = get_task_logger(__name__)
 
@@ -46,6 +49,11 @@ _hora, _minuto = (int(p) for p in HORA_ATUALIZACAO.split(":"))
 DIR_NOTEBOOKS = Path(os.getenv("DIR_NOTEBOOKS", "/workspace/notebooks"))
 NOTEBOOK = os.getenv("NOTEBOOK_REFINAMENTO", "semarh_painel/refinamento_selo_ambiental.ipynb")
 ARQUIVO_ESTADO = Path(os.getenv("ARQUIVO_ESTADO", "/estado/atualizacao.json"))
+# Observabilidade: uma linha JSON por execucao, append-only. E a fonte do
+# historico que aparece no painel e do "o que mudou" da notificacao.
+ARQUIVO_HISTORICO = Path(os.getenv("ARQUIVO_HISTORICO", "/estado/historico.jsonl"))
+# Nome amigavel do dataset de origem, so para a mensagem.
+DATASET = os.getenv("DATASET_ORIGEM", "sermarh_painel/selo_ambiental_2026.parquet")
 VARS_ENV = Path(os.getenv("VARS_ENV", "/opt/painel/vars.env"))
 # Fonte bruta no Dremio (o parquet da zona de entrada, promovido como dataset).
 FONTE_BRUTA = os.getenv(
@@ -53,6 +61,20 @@ FONTE_BRUTA = os.getenv(
     'minio.entrada."sermarh_painel"."selo_ambiental_2026.parquet"',
 )
 TABELA_CONFERE = os.getenv("TABELA_CONFERE", "nessie.refinamento.semarh_painel_fases")
+
+DIAS = ("segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo")
+
+
+def _por_extenso(carimbo: str | None) -> str:
+    """ISO -> "quinta, 13/08/2026 às 11:31" (fuso da stack)."""
+    if not carimbo:
+        return "—"
+    try:
+        quando = datetime.fromisoformat(carimbo).astimezone(FUSO)
+    except ValueError:
+        return carimbo
+    return f"{DIAS[quando.weekday()]}, {quando:%d/%m/%Y às %H:%M}"
+
 
 app = Celery("painel", broker=BROKER, backend=BROKER)
 app.conf.update(
@@ -110,6 +132,37 @@ def _ler_estado() -> dict:
         return {}
 
 
+def _registrar_historico(estado: dict) -> None:
+    """Anexa a execucao ao historico (uma linha JSON por carga)."""
+    try:
+        ARQUIVO_HISTORICO.parent.mkdir(parents=True, exist_ok=True)
+        with ARQUIVO_HISTORICO.open("a") as arquivo:
+            arquivo.write(json.dumps(estado, ensure_ascii=False) + "\n")
+    except Exception as erro:
+        log.warning("não foi possível gravar o histórico: %s", erro)
+
+
+def _ler_manifesto(caminho: Path) -> list[dict]:
+    """Tabelas publicadas na execucao (escritas por `lakehouse.gravar`).
+
+    Vale para qualquer notebook do pipeline, nao so o do Selo Ambiental: quem
+    grava com o helper aparece aqui — e, portanto, na notificacao.
+    """
+    tabelas: dict[str, dict] = {}
+    try:
+        for linha in caminho.read_text().splitlines():
+            registro = json.loads(linha)
+            tabelas[registro["tabela"]] = registro  # a ultima gravacao vale
+    except FileNotFoundError:
+        return []
+    except Exception as erro:
+        log.warning("manifesto ilegível: %s", erro)
+        return []
+    finally:
+        caminho.unlink(missing_ok=True)
+    return sorted(tabelas.values(), key=lambda r: r["tabela"])
+
+
 @app.task(name="painel.atualizar", bind=True)
 def atualizar(self, forcar: bool = False) -> dict:
     """Refaz dataset -> tabelas refinadas -> carimbo para o dashboard.
@@ -140,12 +193,15 @@ def atualizar(self, forcar: bool = False) -> dict:
 
     # 2. dataframe + analise: o MESMO notebook que roda no JupyterLab.
     estimativa = float(_ler_estado().get("duracao_s") or 90)
+    # O notebook anota aqui cada tabela que publicar (ver lakehouse.gravar).
+    manifesto = ARQUIVO_ESTADO.parent / f".manifesto-{self.request.id}.jsonl"
     with tempfile.TemporaryDirectory() as tmp:
         processo = subprocess.Popen(
             ["jupyter", "nbconvert", "--to", "notebook", "--execute",
              "--ExecutePreprocessor.timeout=900",
              "--output", str(Path(tmp) / "execucao.ipynb"), NOTEBOOK],
             cwd=DIR_NOTEBOOKS, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env={**os.environ, "MANIFESTO_PUBLICACAO": str(manifesto)},
         )
         while processo.poll() is None:
             fracao = min((time.monotonic() - inicio) / max(estimativa, 1), 1.0)
@@ -159,11 +215,28 @@ def atualizar(self, forcar: bool = False) -> dict:
         # pela metade). O erro fica no log e no carimbo.
         cauda = (processo.stderr_texto or processo.stdout_texto or "")[-1500:]
         etapas["refinamento"] = "falhou"
-        _gravar_estado({**_ler_estado(),
-                        "ultima_falha_em": datetime.now(FUSO).isoformat(timespec="seconds"),
-                        "erro": cauda, "etapas": etapas})
+        falha = {
+            "atualizado_em": None,
+            "falhou_em": datetime.now(FUSO).isoformat(timespec="seconds"),
+            "duracao_s": round(time.monotonic() - inicio, 1),
+            "origem": "manual" if forcar else "automática",
+            "etapas": etapas,
+            "erro": cauda[-600:],
+            "tarefa": self.request.id,
+        }
+        _gravar_estado({**_ler_estado(), "ultima_falha_em": falha["falhou_em"],
+                        "erro": falha["erro"], "etapas": etapas})
+        _registrar_historico(falha)
+        notificacao.enviar(
+            "🔴 <b>Painel SEMARH — falha na atualização</b>\n"
+            f"Quando: {_por_extenso(falha['falhou_em'])}\n"
+            f"Origem: {falha['origem']}\n"
+            f"<pre>{html.escape(cauda[-500:])}</pre>",
+            evento="falha",
+        )
         raise RuntimeError(f"notebook de refinamento falhou:\n{cauda}")
     etapas["refinamento"] = "ok"
+    tabelas = _ler_manifesto(manifesto)
 
     # 3. confere e carimba — o carimbo e a chave de cache do dashboard.
     progresso(92, "Conferindo as tabelas publicadas")
@@ -174,19 +247,50 @@ def atualizar(self, forcar: bool = False) -> dict:
     except Exception as erro:
         etapas["conferencia"] = f"falhou: {erro}"[:300]
 
+    # 4. varredura do ambiente: o que mudou no Dremio e no MinIO desde a carga
+    # anterior — inclusive coisa criada por fora do pipeline.
+    progresso(96, "Varrendo o catálogo")
+    try:
+        foto = inventario.coletar(_conexao_dremio())
+        novidades = inventario.diferencas(_ler_estado().get("inventario") or {}, foto)
+        etapas["varredura"] = "ok"
+    except Exception as erro:
+        foto, novidades = {}, []
+        etapas["varredura"] = f"falhou: {erro}"[:300]
+        log.warning("varredura do ambiente falhou: %s", erro)
+
     # Carimbo com a hora do FIM: e o que o painel mostra como "atualizado em".
     estado = {
         "atualizado_em": datetime.now(FUSO).isoformat(timespec="seconds"),
         "iniciado_em": agora.isoformat(timespec="seconds"),
         "duracao_s": round(time.monotonic() - inicio, 1),
+        "dataset": DATASET,
+        "tabelas": tabelas,
         "linhas": linhas,
         "origem": "manual" if forcar else "automática",
         "hora_agendada": HORA_ATUALIZACAO,
         "fuso": str(FUSO),
+        "novidades": novidades,
         "etapas": etapas,
         "tarefa": self.request.id,
     }
     progresso(100, "Concluído")
-    _gravar_estado(estado)
+    # A foto do ambiente fica so no estado (e grande); no historico vai o diff.
+    _gravar_estado({**estado, "inventario": foto})
+    _registrar_historico(estado)
+
+    # Mensagem curta: o que foi publicado, o que mudou no ambiente e quando.
+    linhas_msg = [
+        "🟢 <b>Dados atualizados</b>",
+        f"{_por_extenso(estado['atualizado_em'])}",
+        f"Dataset: <code>{html.escape(DATASET)}</code>",
+    ]
+    linhas_msg += [f"• <code>{html.escape(t['tabela'])}</code> — {t['linhas']} linhas"
+                   for t in tabelas] or ["(nenhuma tabela publicada)"]
+    if novidades:
+        linhas_msg.append("\n<b>Novidades no ambiente:</b>")
+        linhas_msg += [f"• {html.escape(n)}" for n in novidades]
+    notificacao.enviar("\n".join(linhas_msg), evento="sucesso")
+
     log.info("painel atualizado: %s", estado)
     return estado

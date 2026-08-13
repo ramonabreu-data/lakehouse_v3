@@ -187,7 +187,36 @@ def gravar(df, tabela, modo="substituir", particao=None):
 
     total = spark.table(destino).count()
     print(f"  {destino}: {total} linhas  ->  s3a://{ZONA_ARMAZEM}/{camada}/")
+    _registrar_publicacao(destino, total)
     return destino
+
+
+def _registrar_publicacao(tabela: str, linhas: int) -> None:
+    """Anota "tabela X ficou com N linhas" no manifesto da execucao.
+
+    Quem liga isso e o servico de atualizacao (Celery), apontando
+    MANIFESTO_PUBLICACAO para um arquivo da execucao. E assim que a notificacao
+    sabe o que foi publicado sem que ninguem precise listar as tabelas na mao —
+    qualquer notebook que use `gravar` entra no aviso automaticamente.
+
+    Fora desse contexto (rodando no JupyterLab), a variavel nao existe e a
+    funcao nao faz nada.
+    """
+    caminho = os.getenv("MANIFESTO_PUBLICACAO")
+    if not caminho:
+        return
+    import json
+    from datetime import datetime
+
+    try:
+        with open(caminho, "a") as arquivo:
+            arquivo.write(json.dumps({
+                "tabela": tabela,
+                "linhas": linhas,
+                "quando": datetime.now().astimezone().isoformat(timespec="seconds"),
+            }, ensure_ascii=False) + "\n")
+    except Exception as erro:  # nunca derruba a gravacao por causa do log
+        print(f"  aviso: nao consegui registrar o manifesto ({erro})")
 
 
 # --------------------------------------------------------------------------

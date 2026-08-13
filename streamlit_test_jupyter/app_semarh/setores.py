@@ -8,8 +8,8 @@ from app_semarh.bis import selo_ambiental
 from app_semarh.bis.em_construcao import render_para
 
 SETORES = [
-    {"slug": "gestao", "titulo": "Superintendência de Gestão", "bis": []},
-    {"slug": "meio_ambiente", "titulo": "Superintendência de Meio Ambiente", "bis": []},
+    # Chefia de Gabinete primeiro: e a area com os BIs publicados, entao e a
+    # que abre por padrao (o painel escolhe o primeiro setor que tem BI).
     {
         "slug": "chefia",
         "titulo": "Chefia de Gabinete",
@@ -23,5 +23,7 @@ SETORES = [
             {"slug": "pacto_queimadas", "titulo": "Pacto Piauí Sem Queimadas", "render": render_para("Pacto Piauí Sem Queimadas")},
         ],
     },
+    {"slug": "gestao", "titulo": "Superintendência de Gestão", "bis": []},
+    {"slug": "meio_ambiente", "titulo": "Superintendência de Meio Ambiente", "bis": []},
     {"slug": "psi_pilares", "titulo": "PSI&Pilares II", "bis": []},
 ]

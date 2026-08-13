@@ -36,15 +36,6 @@ VISOES = {
 }
 # Sufixo do titulo por visao (o rotulo do seletor e mais longo).
 TITULO_VISAO = {"3": "3ª fase", "2": "2ª fase", "1": "1ª fase", BALANCO: "Balanço anual"}
-CONTEXTO_FASE = {
-    3: "**3ª fase** — resultado final (pós-recurso), 224 municípios. É o número oficial da "
-       "edição 2026.",
-    2: "**2ª fase** — parcial: situação após a análise dos recursos, antes da consolidação. "
-       "Serve para comparação; o resultado válido é o da 3ª fase.",
-    1: "**1ª fase** — parcial: avaliação inicial, antes dos recursos. É a fase publicada no "
-       "painel antigo (Looker Studio) — se você está comparando com ele, é aqui que os números "
-       "batem.",
-}
 
 # Selo A/B/C e ordinal (A melhor -> C). Tres tons de verde ficavam parecidos
 # demais num ponto de mapa: a rampa vai de verde a laranja (RdYlGn), que separa
@@ -79,27 +70,6 @@ def _regra(df: pd.DataFrame) -> pd.Series:
     return base.groupby("criterios_atendidos")["resultado"].agg(lambda s: s.mode().iat[0])
 
 
-def _faixas(regra: pd.Series) -> list[tuple[str, str]]:
-    """Comprime a regra em faixas legiveis: [("6+", "Selo A"), ("4–5", ...)]."""
-    grupos: list[list] = []
-    for crit, res in regra.sort_index().items():
-        if grupos and grupos[-1][0] == res and grupos[-1][2] == crit - 1:
-            grupos[-1][2] = crit
-        else:
-            grupos.append([res, crit, crit])
-    topo = regra.index.max()
-    faixas = []
-    for res, ini, fim in grupos:
-        if fim == topo:
-            rotulo = f"{int(ini)}+"
-        elif ini == fim:
-            rotulo = f"{int(ini)}"
-        else:
-            rotulo = f"{int(ini)}–{int(fim)}"
-        faixas.append((rotulo, res))
-    return faixas
-
-
 def _cor_faixa(faixa: str, regra: pd.Series) -> str:
     """Cor da barra de criterios = cor do selo que aquela faixa gera."""
     if faixa == SEM_AVALIACAO:
@@ -108,43 +78,6 @@ def _cor_faixa(faixa: str, regra: pd.Series) -> str:
     if resultado in ("Selo A", "Selo B", "Selo C"):
         return COR_SELO[resultado[-1]]
     return "#9e9e9e"
-
-
-def _analise(df: pd.DataFrame, regra: pd.Series) -> None:
-    """Leitura do conjunto — toda medida sai do dado carregado, nada fixo.
-
-    Sempre sobre os 224 municipios (nao sobre o filtro): a regra e a leitura de
-    consistencia valem para a edicao inteira.
-    """
-    faixas = " · ".join(f"{rotulo} → {res}" for rotulo, res in _faixas(regra))
-    st.caption(f"**Como o selo é definido (critérios atendidos):** {faixas}")
-
-    com_selo = df[df["tem_selo"]]
-    if {"A", "C"} <= set(com_selo["selo"].dropna()):
-        teto_c = com_selo.loc[com_selo["selo"] == "C", "pontos"].max()
-        piso_a = com_selo.loc[com_selo["selo"] == "A", "pontos"].min()
-        if teto_c > piso_a:
-            n = int((com_selo.loc[com_selo["selo"] == "A", "pontos"] < teto_c).sum())
-            st.caption(
-                f"A **pontuação não decide o selo**: o maior Selo C tem {teto_c:.1f} pontos e o "
-                f"menor Selo A tem {piso_a:.1f} — {n} municípios com Selo A pontuam menos que o "
-                "melhor Selo C. Para ranquear desempenho use os critérios; a pontuação é desempate."
-            )
-
-    # Excecao = municipio cujo resultado nao e o predominante da sua quantidade
-    # de criterios. E sinal de divergencia na FONTE, nao de erro do painel.
-    base = df.dropna(subset=["criterios_atendidos"])
-    fora = base[base["criterios_atendidos"].map(regra) != base["resultado"]]
-    if not fora.empty:
-        casos = " · ".join(
-            f"{r.municipio} ({int(r.criterios_atendidos)} critérios → {r.resultado})"
-            for r in fora.itertuples()
-        )
-        verbo = "município destoa" if len(fora) == 1 else "municípios destoam"
-        st.caption(
-            f"⚠️ **{len(fora)} de {len(base)} {verbo} da regra na fonte:** {casos}. "
-            "O painel reproduz a fonte como está — a correção é na origem."
-        )
 
 
 def _selecionados(evento, parametro: str, campo: str) -> list[str]:
@@ -370,17 +303,10 @@ def render(user: dict | None) -> None:
         ajuda="As 3 fases da edição 2026 ou o balanço anual, que mostra as três juntas. "
               "O resultado válido é o da 3ª fase; as anteriores são parciais.",
     )
-    # A fase tambem entra no titulo: ela muda TODOS os numeros da tela, e
-    # comparar a fase errada com o painel antigo foi a origem de toda a
-    # confusao de "divergencia". No seletor sozinho passava despercebido.
+    # A fase entra no titulo porque muda TODOS os numeros da tela — no seletor
+    # sozinho passava despercebido. O contexto de cada fase fica na ajuda do
+    # seletor, nao ocupando a tela.
     st.subheader(f"Selo Ambiental 2026 — Piauí · {TITULO_VISAO[visao]}")
-    if visao == BALANCO:
-        st.caption(
-            "Evolução das três fases sobre os mesmos 224 municípios: da avaliação inicial "
-            "(1ª) ao resultado final (3ª). Os filtros abaixo valem para os três funis e para a tabela."
-        )
-    else:
-        st.caption(CONTEXTO_FASE.get(int(visao), ""))
 
     df = (todas if visao == BALANCO else todas[todas["fase"] == int(visao)]).copy()
 
@@ -525,8 +451,6 @@ def render(user: dict | None) -> None:
                 f"A barra **0** inclui {sem_apuracao} município(s) não habilitado(s), sem "
                 "apuração na fonte — mesmo critério do painel de origem."
             )
-
-    _analise(df, regra)
 
     st.divider()
 

@@ -11,16 +11,22 @@ roda a carga diária — um caminho só para os dois casos.
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pandas as pd
 import streamlit as st
 
 from app_semarh.dados import estado_atualizacao
 
 FUSO = ZoneInfo(os.getenv("TZ", "America/Fortaleza"))
+# Uma linha JSON por carga, gravada pelo worker. E o log de observabilidade.
+ARQUIVO_HISTORICO = Path(os.getenv("ARQUIVO_HISTORICO", "/estado/historico.jsonl"))
+ULTIMAS = 15
 BROKER = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
 TAREFA = "painel.atualizar"
 # Teto de espera do botao: a carga leva ~1,5 min; 10 min cobre um Dremio frio.
@@ -69,6 +75,39 @@ def _acompanhar(resultado, barra) -> tuple[bool, str]:
     return False, "A atualização passou do tempo limite. Veja `docker compose logs celery-worker`."
 
 
+def historico(limite: int = ULTIMAS) -> pd.DataFrame:
+    """Últimas cargas: quando, origem, duração e o que mudou."""
+    try:
+        linhas = ARQUIVO_HISTORICO.read_text().splitlines()
+    except Exception:
+        return pd.DataFrame()
+    registros = []
+    for linha in linhas[-limite:]:
+        try:
+            r = json.loads(linha)
+        except ValueError:
+            continue
+        carimbo = r.get("atualizado_em") or r.get("falhou_em")
+        tabelas = r.get("tabelas") or []
+        registros.append({
+            "Quando": _hora_curta(carimbo),
+            "Situação": "✅ ok" if r.get("atualizado_em") else "🔴 falhou",
+            "Origem": r.get("origem", "—"),
+            "Tabelas": "; ".join(f"{t['tabela'].split('.')[-1]} ({t['linhas']})" for t in tabelas)
+                       or ("—" if r.get("atualizado_em") else (r.get("erro") or "")[-80:]),
+        })
+    return pd.DataFrame(reversed(registros))
+
+
+def _hora_curta(carimbo: str | None) -> str:
+    if not carimbo:
+        return "—"
+    try:
+        return datetime.fromisoformat(carimbo).astimezone(FUSO).strftime("%d/%m %H:%M")
+    except ValueError:
+        return carimbo
+
+
 def bloco_sidebar() -> None:
     """Rodapé da sidebar: última atualização + botão de atualizar agora."""
     barra_area = st.sidebar.empty()
@@ -91,3 +130,9 @@ def bloco_sidebar() -> None:
             st.rerun()
         else:
             st.sidebar.error(mensagem)
+
+    # Log das ultimas cargas — quem rodou, quando e o que mudou no resultado.
+    registros = historico()
+    if not registros.empty:
+        with st.sidebar.expander(f"Histórico ({len(registros)} últimas)"):
+            st.dataframe(registros, hide_index=True, width='stretch')
