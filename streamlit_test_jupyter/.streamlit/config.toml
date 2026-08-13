@@ -1,0 +1,12 @@
+# Configuracao do Streamlit do painel. Lida por rodar com working_dir aqui
+# (/workspace/streamlit no container do servico `dashboard`).
+
+[global]
+# `streamlit-cookies-manager` 0.2.0 (sem manutencao) decora uma funcao com o
+# `st.cache` legado. O aviso amarelo aparecia no topo do painel a cada carga e
+# nao ha o que corrigir do nosso lado: a lib emite no import, antes de qualquer
+# monkeypatch nosso rodar. Ver auth/cookies.py.
+suppressDeprecationWarnings = true
+
+[browser]
+gatherUsageStats = false

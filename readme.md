@@ -19,14 +19,15 @@ precisa ser editado para atender um novo cliente.
 2. [Requisitos](#requisitos)
 3. [Implantar em um novo projeto](#implantar-em-um-novo-projeto)
 4. [Passo a passo](#passo-a-passo)
-5. [Autenticação do dashboard](#autenticação-do-dashboard)
-6. [Notebooks-modelo](#notebooks-modelo)
-7. [Imagem do Spark/Jupyter](#imagem-do-sparkjupyter)
-8. [Zonas do object store](#zonas-do-object-store)
-9. [Portas e endereços](#portas-e-endereços)
-10. [Validação de ponta a ponta](#validação-de-ponta-a-ponta)
-11. [Segurança](#segurança)
-12. [Estrutura do repositório](#estrutura-do-repositório)
+5. [Atualização automática (Celery)](#atualização-automática-celery)
+6. [Autenticação do dashboard](#autenticação-do-dashboard)
+7. [Notebooks-modelo](#notebooks-modelo)
+8. [Imagem do Spark/Jupyter](#imagem-do-sparkjupyter)
+9. [Zonas do object store](#zonas-do-object-store)
+10. [Portas e endereços](#portas-e-endereços)
+11. [Validação de ponta a ponta](#validação-de-ponta-a-ponta)
+12. [Segurança](#segurança)
+13. [Estrutura do repositório](#estrutura-do-repositório)
 
 ---
 
@@ -53,6 +54,12 @@ flowchart LR
         SDB[(Postgres<br/>usuários)]
     end
 
+    subgraph Automação
+        BEAT[celery-beat<br/>todo dia às 7h]
+        WRK[celery-worker<br/>refaz o refinamento]
+        RDS[(Redis<br/>fila)]
+    end
+
     USR([Navegador]) -->|HTTPS 443| CAD[Caddy<br/>reverse proxy + TLS]
     CAD -.->|dashboard.| STL
     CAD -.->|dremio.| DRE
@@ -69,6 +76,9 @@ flowchart LR
     STL -->|Arrow Flight :32010| DRE
     STL -->|login / admin| GT
     GT --> SDB
+    BEAT --> RDS --> WRK
+    WRK -->|reexecuta o notebook| NES
+    WRK -.->|carimbo de atualização| STL
 ```
 
 Os serviços ficam numa rede Docker chamada `interna` (que o Compose publica como
@@ -475,6 +485,62 @@ docker compose down -v   # apaga TAMBÉM os dados de todos os serviços
 
 ---
 
+---
+
+## Atualização automática (Celery)
+
+Os dados são recarregados **todo dia às 07:00** (`HORA_ATUALIZACAO` no `.env`), no fuso
+**America/Fortaleza** — o mesmo usado no agendamento, no carimbo da atualização, nas sessões Spark
+e no que o painel exibe. Os serviços sobem com o `docker compose up -d`; não há nada para iniciar
+à mão.
+
+| Serviço | Papel |
+|---|---|
+| `redis` | Fila do Celery (broker + resultados). Efêmero: sem RDB nem AOF |
+| `celery-beat` | Agendador — publica a tarefa às 07:00 |
+| `celery-worker` | Executa a tarefa. Usa a **mesma imagem do Spark**, porque sobe um driver Spark |
+
+O que a tarefa faz, em [`celery_app/tarefas.py`](celery_app/tarefas.py):
+
+1. **Dataset** — `ALTER TABLE … REFRESH METADATA` no parquet da zona de entrada, para o Dremio
+   enxergar um arquivo novo publicado no MinIO.
+2. **DataFrame + análise** — reexecuta o **mesmo notebook** de refinamento que uma pessoa roda no
+   JupyterLab (`semarh_painel/refinamento_selo_ambiental.ipynb`), regravando
+   `refinamento.semarh_painel`, `..._fases` e os dois resumos. Não há lógica duplicada entre o
+   notebook e a tarefa — se as validações do notebook falharem, a tarefa falha e **as tabelas
+   antigas continuam no ar**; nada é publicado pela metade.
+3. **Dashboard** — grava o carimbo em `/estado/atualizacao.json` (volume `painel-estado`,
+   compartilhado com o serviço `dashboard`). O Streamlit usa esse carimbo como chave de cache:
+   o dado novo aparece assim que o refinamento termina, sem esperar o TTL de 5 min.
+
+### Atualizar na hora, pelo painel
+
+No rodapé da barra lateral ficam **a data/hora da última carga** e o botão **"Atualizar dados
+agora"**. O botão não processa nada no painel: publica a **mesma** tarefa na fila e acompanha o
+andamento numa barra de porcentagem (a etapa longa avança pelo tempo decorrido, usando a duração
+da execução anterior como estimativa). Ao terminar, a página recarrega já com o dado novo.
+
+A data/hora exibida é sempre a da última carga concluída — automática ou manual, com a origem entre
+parênteses:
+
+```
+🕒 Atualizado em: quinta, 13/08/2026 às 11:31 (manual)
+```
+
+```bash
+docker compose logs -f celery-worker                                  # acompanhar
+docker compose exec celery-worker celery -A celery_app.tarefas call painel.atualizar   # rodar agora
+docker compose exec celery-worker cat /estado/atualizacao.json        # último resultado
+```
+
+> **Memória**: cada execução sobe um driver Spark (~1,5 min, ~1 GB). Em máquina apertada, evite
+> disparar o botão enquanto o Dremio estiver sob carga.
+>
+> O worker roda com `--concurrency=1` de propósito: duas execuções simultâneas brigariam pelo
+> commit no Nessie e pela RAM do driver. Um disparo manual durante a carga diária espera na fila.
+
+---
+
 ## Autenticação do dashboard
 
 O dashboard fica atrás de um login. Quem valida o acesso é o **Supabase GoTrue**; o Streamlit
@@ -801,6 +867,7 @@ depuração local, ou ficam apenas na rede interna do Docker:
 | Supabase GoTrue | `127.0.0.1:9999` | API de autenticação |
 | PostgreSQL / MongoDB | `127.0.0.1:5435` / `127.0.0.1:27017` | bancos de origem |
 | `dashboard` (Streamlit) | só rede interna, `dashboard:8501` | painel; acesso só pelo proxy |
+| `redis` / `celery-worker` / `celery-beat` | só rede interna | fila e atualização automática (sem porta publicada) |
 | `supabase-db`, Spark 7077, Dremio 45678 | só rede interna | não publicam no host |
 
 Dentro da rede Docker os serviços se falam pelo nome (`dremio:9047`, `minio:9000`, `nessie:19120`,
@@ -839,6 +906,8 @@ Ambiente de referência: Docker 29.6.1, Compose v5.3.0, kernel Linux 7.0, x86_64
 | GoTrue: 54 migrações aplicadas; `/health` OK; master criado no 1º boot | ✅ |
 | Streamlit: login Supabase + sessão em cookie + Arrow Flight (`:32010`) + query federada | ✅ |
 | Serviço `dashboard` sobe no `docker compose up -d`, fica `healthy` e responde em `https://dashboard.localhost` | ✅ |
+| Celery: worker + beat sobem com a stack; carga diária agendada para 07:00 (America/Fortaleza) | ✅ |
+| Botão "Atualizar dados agora" na sidebar: publica a tarefa, mostra a porcentagem e atualiza o carimbo (93 s de ponta a ponta) | ✅ |
 | Auth: signup público bloqueado; master cria/remove visualizador; visualizador entra sem ser admin | ✅ |
 | Notebooks-modelo executados de ponta a ponta (`nbconvert --execute`) | ✅ |
 | Pipeline completo: PostgreSQL/CSV/JSON → `coleta` → `limpeza` → `refinamento` → Streamlit | ✅ |
@@ -894,8 +963,11 @@ dremio-spark-minio/
 ├── .env.example                      # template versionável do .env
 ├── .gitignore
 ├── readme.md
+├── celery_app/                       # atualização diária (07:00) + botão manual
+│   ├── __init__.py
+│   └── tarefas.py                    # tarefa painel.atualizar (dataset → tabelas → carimbo)
 ├── docker/
-│   ├── spark/                        # imagem propria do Spark/Jupyter
+│   ├── spark/                        # imagem propria do Spark/Jupyter (também roda o Celery)
 │   │   ├── Dockerfile
 │   │   └── requirements.txt          # libs de DS/ML + streamlit-cookies-manager
 │   ├── caddy/Caddyfile               # reverse proxy TLS (subdomínios + CA interna)

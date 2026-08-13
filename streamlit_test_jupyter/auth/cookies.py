@@ -15,8 +15,28 @@ import os
 from datetime import datetime, timedelta
 from typing import Any
 
-from streamlit_cookies_manager import EncryptedCookieManager
-from streamlit_cookies_manager import cookie_manager as _cookie_manager
+import streamlit as _st
+
+# --- Aviso amarelo do `st.cache` legado ------------------------------------
+# A lib decora `key_from_parameters` com o `st.cache` legado NO IMPORT, entao o
+# aviso de depreciacao aparece no topo do painel antes de qualquer patch nosso
+# rodar (e `global.suppressDeprecationWarnings` nao alcanca esse aviso). Troca
+# `st.cache` por um equivalente moderno durante o import da lib e devolve o
+# original em seguida — o aviso nunca chega a ser emitido.
+def _cache_compat(*args, **kwargs):
+    """Aceita `@st.cache` e `@st.cache(...)`, mapeando para cache_resource."""
+    if args and callable(args[0]) and not kwargs:
+        return _st.cache_resource(show_spinner=False)(args[0])
+    return lambda funcao: _st.cache_resource(show_spinner=False)(funcao)
+
+
+_cache_original = _st.cache
+_st.cache = _cache_compat
+try:
+    from streamlit_cookies_manager import EncryptedCookieManager
+    from streamlit_cookies_manager import cookie_manager as _cookie_manager
+finally:
+    _st.cache = _cache_original
 
 # --- Compatibilidade Streamlit >= 1.36 -------------------------------------
 # A lib renderiza o componente de save sempre com a mesma key fixa

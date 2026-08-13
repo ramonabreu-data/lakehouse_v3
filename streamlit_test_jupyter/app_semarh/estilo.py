@@ -75,9 +75,55 @@ section[data-testid="stSidebar"] .stButton > button {
 .kpi-v { font-size: clamp(1.05rem, 3.4vw, 1.55rem); font-weight: 700; line-height: 1.15; }
 .kpi-l { font-size: clamp(.62rem, 1.9vw, .78rem); opacity: .72; margin-top: .12rem; }
 
+/* ---- legenda do mapa (chips categoricos ou barra de gradiente) ---- */
+.legenda {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: .3rem .8rem;
+    font-size: clamp(.7rem, 1.9vw, .82rem);
+    margin: .45rem 0 .2rem;
+}
+.legenda .leg-item { display: inline-flex; align-items: center; gap: .32rem; white-space: nowrap; }
+.legenda .leg-item i {
+    width: .72rem;
+    height: .72rem;
+    border-radius: 50%;
+    border: 1px solid rgba(255, 255, 255, .75);
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, .12);
+}
+.legenda .leg-barra {
+    display: inline-block;
+    width: clamp(90px, 22vw, 190px);
+    height: .55rem;
+    border-radius: 4px;
+    border: 1px solid rgba(128, 128, 128, .35);
+}
+.legenda .leg-min, .legenda .leg-max { opacity: .75; }
+
 /* ---- tabela/mapa ocupam a largura e rolam se preciso ---- */
 [data-testid="stDataFrame"] { width: 100%; }
 [data-testid="stElementToolbar"] { display: none; }
+
+/* ---- moldura fina em cada visual (grafico, mapa, tabela) ----
+   Uma linha de 1px em cinza translucido: funciona no tema claro e no escuro
+   sem precisar de duas paletas. O titulo fica FORA da moldura, acima dela,
+   como no painel de origem. */
+[data-testid="stVegaLiteChart"],
+[data-testid="stDeckGlJsonChart"],
+[data-testid="stDataFrame"],
+.stVegaLiteChart,
+.stDeckGlJsonChart,
+.stDataFrame {
+    border: 1px solid rgba(128, 128, 128, .22);
+    border-radius: 12px;
+    padding: .55rem;
+    background: rgba(128, 128, 128, .025);
+    /* o mapa e desenhado em canvas: sem isto ele vaza os cantos arredondados */
+    overflow: hidden;
+}
+/* a tabela ja desenha a propria borda interna — nao precisa de respiro extra */
+[data-testid="stDataFrame"], .stDataFrame { padding: 0; }
 </style>
 """
 

@@ -10,6 +10,7 @@ Um setor pode ter varios BIs; hoje so a Chefia de Gabinete tem um
 
 import streamlit as st
 
+from app_semarh import atualizacao
 from app_semarh.setores import SETORES
 
 
@@ -30,13 +31,17 @@ def render(user: dict | None) -> None:
         if st.sidebar.button(
             s["titulo"],
             key=f"setor_{s['slug']}",
-            use_container_width=True,
+            width='stretch',
             type="primary" if ativo else "secondary",
         ):
             st.query_params["setor"] = s["slug"]
             if "bi" in st.query_params:
                 del st.query_params["bi"]
             st.rerun()
+
+    # --- sidebar: rodape com a data da ultima carga e o botao de atualizar ---
+    st.sidebar.divider()
+    atualizacao.bloco_sidebar()
 
     setor = por_slug[setor_atual]
 

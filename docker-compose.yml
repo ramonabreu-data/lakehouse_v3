@@ -98,10 +98,16 @@ services:
     environment:
       # O app tambem faz load_dotenv("vars.env"); estes sao os defaults da stack.
       - PYTHONUNBUFFERED=1
+      - TZ=America/Fortaleza
+      # O botao "Atualizar dados agora" publica a tarefa nesta fila.
+      - CELERY_BROKER_URL=redis://redis:6379/0
       - SUPABASE_URL=http://supabase-auth:9999
       - JWT_SECRET=${JWT_SECRET}
     volumes:
       - ./streamlit_test_jupyter:/workspace/streamlit
+      # Carimbo da ultima atualizacao automatica (gravado pelo celery-worker).
+      # Somente leitura: o painel le, quem escreve e o worker.
+      - painel-estado:/estado:ro
     # 8501 nao e publicado no host: o acesso e por https://dashboard.${DOMAIN}.
     entrypoint: >
       /bin/bash -c "
@@ -116,7 +122,102 @@ services:
     depends_on:
       dremio:
         condition: service_started
+      redis:
+        condition: service_healthy
       supabase-auth:
+        condition: service_healthy
+    networks: [interna]
+
+  # ---------------------------------------------------------------------------
+  # Atualizacao automatica do painel (Celery). Sobe junto com a stack: todo dia
+  # as HORA_ATUALIZACAO (07:00, fuso America/Fortaleza) o worker refaz dataset
+  # -> tabelas refinadas -> carimbo lido pelo dashboard. O botao "Atualizar
+  # dados agora" da sidebar publica a MESMA tarefa nesta fila.
+  # Ver celery_app/tarefas.py.
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: ${PROJETO}_redis
+    restart: unless-stopped
+    # Fila efemera: sem RDB e sem AOF. Se o Redis reiniciar, o beat reagenda no
+    # proximo tique — nao ha estado que valha a pena persistir aqui.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [interna]
+
+  celery-worker:
+    platform: linux/amd64
+    # Mesma imagem do spark: a tarefa sobe um driver Spark e roda o notebook.
+    build:
+      context: ./docker/spark
+    image: ${PROJETO}/spark-lakehouse:1.0
+    container_name: ${PROJETO}_celery_worker
+    restart: unless-stopped
+    working_dir: /workspace
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/workspace:/workspace/notebooks
+      - TZ=America/Fortaleza
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - HORA_ATUALIZACAO=${HORA_ATUALIZACAO:-07:00}
+      # Mesmas credenciais do Spark: o refinamento le do MinIO e grava no Nessie.
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - MINIO_ENDPOINT=http://minio:9000
+      - NESSIE_URI=http://nessie:19120/api/v2
+      - ZONA_ARMAZEM=${ZONA_ARMAZEM}
+      - ZONA_ENTRADA=${ZONA_ENTRADA}
+      - ZONA_HISTORICO=${ZONA_HISTORICO}
+    volumes:
+      - ./celery_app:/workspace/celery_app
+      - ./notebooks:/workspace/notebooks
+      # Conta de servico do Dremio: a mesma que o painel usa para consultar.
+      - ./streamlit_test_jupyter/vars.env:/opt/painel/vars.env:ro
+      - painel-estado:/estado
+    # concurrency=1: as tarefas gravam nas mesmas tabelas Iceberg. Duas ao mesmo
+    # tempo brigariam pelo commit no Nessie (e pela RAM do driver Spark).
+    command: >
+      celery -A celery_app.tarefas worker
+      --loglevel=INFO --concurrency=1 --without-gossip --without-mingle
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      nessie:
+        condition: service_started
+      dremio:
+        condition: service_started
+    networks: [interna]
+
+  celery-beat:
+    platform: linux/amd64
+    build:
+      context: ./docker/spark
+    image: ${PROJETO}/spark-lakehouse:1.0
+    container_name: ${PROJETO}_celery_beat
+    restart: unless-stopped
+    working_dir: /workspace
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/workspace:/workspace/notebooks
+      - TZ=America/Fortaleza
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - HORA_ATUALIZACAO=${HORA_ATUALIZACAO:-07:00}
+    volumes:
+      - ./celery_app:/workspace/celery_app
+      - painel-estado:/estado
+    # O agendador so publica a mensagem na fila; quem executa e o worker.
+    command: >
+      celery -A celery_app.tarefas beat
+      --loglevel=INFO --schedule=/estado/celerybeat-schedule
+    depends_on:
+      redis:
         condition: service_healthy
     networks: [interna]
 
@@ -292,6 +393,7 @@ services:
     networks: [interna]
 
 volumes:
+  painel-estado:
   dremio-data:
   minio-data:
   nessie-data:

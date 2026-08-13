@@ -38,4 +38,9 @@ import shap, optuna, mlflow, catboost, prophet, geopandas; \
 assert numpy.__version__.startswith('1.'), f'numpy 2.x quebra TF/torch: {numpy.__version__}'; \
 print('OK', 'numpy', numpy.__version__, '| tf', tf.__version__, '| torch', torch.__version__)"
 
+# Agendador da atualizacao automatica (servicos celery-worker e celery-beat).
+# Fica numa camada PROPRIA no fim do arquivo de proposito: mexer aqui nao
+# invalida o cache do pip pesado acima, entao o rebuild leva segundos.
+RUN pip install --no-cache-dir "celery[redis]==5.4.0"
+
 WORKDIR /workspace

@@ -90,7 +90,7 @@ def sessao(nome: str = "notebook", pacotes_extra=(), memoria: str = "1g"):
         .config("spark.hadoop.fs.s3a.access.key", MINIO_KEY)
         .config("spark.hadoop.fs.s3a.secret.key", MINIO_SECRET)
         .config("spark.driver.memory", memoria)
-        .config("spark.sql.session.timeZone", "America/Recife")
+        .config("spark.sql.session.timeZone", "America/Fortaleza")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("ERROR")
