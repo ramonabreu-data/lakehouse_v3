@@ -5,14 +5,19 @@ a tarefa `painel.atualizar` refaz o caminho inteiro do dado:
 
 1. **Datasets** — manda o Dremio reler os metadados dos parquets da zona de
    entrada, para enxergar um arquivo novo publicado no MinIO.
-2. **DataFrame + analise** — reexecuta os notebooks de refinamento no Spark (um
+2. **Quem mudou** — compara a assinatura do arquivo de origem de cada edicao com
+   a da carga anterior. So segue adiante a edicao que recebeu arquivo novo: a
+   gravacao Iceberg e integral, entao reprocessar uma edicao intacta so
+   acumularia mais uma copia da mesma tabela no armazem.
+3. **DataFrame + analise** — reexecuta os notebooks de refinamento no Spark (um
    por edicao do Selo Ambiental), que regravam as tabelas de `refinamento` e os
    resumos. Sao os mesmos notebooks que uma pessoa roda no JupyterLab: nao ha
    logica duplicada aqui.
-3. **Views** — recria as views curadas do space `refinamento`, que sao o caminho
+4. **Views** — recria as views curadas do space `refinamento`, que sao o caminho
    pelo qual o painel enxerga o dado. Sao elas o contrato: o nome fisico da
-   tabela no Nessie pode mudar sem que o Streamlit saiba.
-4. **Dashboard** — grava o carimbo da atualizacao num arquivo compartilhado com
+   tabela no Nessie pode mudar sem que o Streamlit saiba. Rodam sempre, mesmo
+   quando nada foi reprocessado — e metadado, nao copia dado.
+5. **Dashboard** — grava o carimbo da atualizacao num arquivo compartilhado com
    o Streamlit. O painel usa esse carimbo como chave de cache, entao o dado novo
    aparece na proxima interacao, sem esperar o TTL de 5 min vencer.
 
@@ -196,6 +201,51 @@ def _conexao_dremio():
     return DremioConnection(token, f"grpc://{os.getenv('DREMIO_FLIGHT_ENDPOINT', 'dremio:32010')}")
 
 
+def _impressao_origem() -> dict[str, str]:
+    """Assinatura do arquivo de origem de cada edição, direto do MinIO.
+
+    Usa `head_object`: le so os metadados (ETag, tamanho, data), sem baixar o
+    arquivo. O ETag do MinIO e o MD5 do conteudo em upload simples, entao a
+    assinatura muda exatamente quando o arquivo muda — reenviar o mesmo arquivo
+    por cima nao conta como mudanca, que e o comportamento desejado.
+    """
+    import boto3
+
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=os.getenv("MINIO_ENDPOINT", "http://minio:9000"),
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+        region_name=os.getenv("AWS_REGION", "us-east-1"),
+    )
+    impressoes = {}
+    for edicao in EDICOES:
+        try:
+            cabecalho = s3.head_object(Bucket=ZONA_ENTRADA, Key=edicao["arquivo"])
+            etag = cabecalho["ETag"].strip('"')
+            impressoes[edicao["arquivo"]] = f"{etag}:{cabecalho['ContentLength']}"
+        except Exception as erro:
+            # Sem assinatura, a edicao NAO e pulada — na duvida, reprocessa.
+            log.warning("não consegui ler a origem de %s: %s", edicao["titulo"], erro)
+    return impressoes
+
+
+def _tabelas_no_lugar(conexao, edicao: dict) -> bool:
+    """As tabelas desta edição existem e respondem?
+
+    Guarda contra o pior efeito de pular: origem intacta mas tabela apagada por
+    fora deixaria o painel quebrado ate alguem forcar uma carga. Se qualquer uma
+    nao responder, a edicao volta a ser processada.
+    """
+    for tabela in edicao["views"].values():
+        try:
+            conexao.toPandas(f"SELECT COUNT(*) AS n FROM nessie.refinamento.{tabela}")
+        except Exception:
+            log.info("%s: tabela %s ausente — vai reprocessar", edicao["titulo"], tabela)
+            return False
+    return True
+
+
 def _garantir_views(conexao) -> None:
     """Recria as pastas e as views curadas que o painel consulta.
 
@@ -323,30 +373,51 @@ def _bloco_edicao(edicao: dict, estado: dict, anteriores: dict[str, int]) -> lis
     linhas_origem = estado.get("linhas_origem") or {}
     publicadas = {t["tabela"]: t["linhas"] for t in (estado.get("tabelas") or [])}
     total_origem = linhas_origem.get(edicao["dataset"])
+    pulada = edicao["titulo"] in (estado.get("puladas") or [])
 
+    selo = " · <i>sem mudança</i>" if pulada else " · <b>atualizada</b>"
     linhas = [
-        f"<b>▊ {html.escape(edicao['titulo'])}</b>",
+        f"<b>▊ {html.escape(edicao['titulo'])}</b>{selo}",
         "",
         f"<u>Origem</u> · MinIO, zona <code>{ZONA_ENTRADA}</code>",
         f"    arquivo · <code>{html.escape(edicao['arquivo'])}</code>"
         + (f" — {total_origem} linhas" if total_origem is not None else ""),
         f"    dataset · <code>{html.escape(edicao['dataset'])}</code>",
         "",
-        "<u>Refinamento</u> · Spark",
-        f"    notebook · <code>{html.escape(edicao['notebook'])}</code>",
-        "",
-        f"<u>Tabelas</u> · Iceberg, zona <code>{ZONA_ARMAZEM}</code>, catálogo Nessie",
     ]
-    # Percorre as tabelas DESTA edicao na ordem declarada, nao a ordem alfabetica
-    # do manifesto: assim a principal (`_fases`) nao cai no meio da lista.
-    for tabela in edicao["views"].values():
-        completo = f"nessie.refinamento.{tabela}"
-        if completo not in publicadas:
-            linhas.append(f"    ✗ <code>{html.escape(tabela)}</code> — não publicada nesta carga")
-            continue
-        n = publicadas[completo]
-        linhas.append(f"    • <code>{html.escape(tabela)}</code> — {n} linhas"
-                      + _variacao(n, anteriores.get(completo)))
+    if pulada:
+        # Edicao intacta: nada foi reescrito. Dizer QUAIS tabelas continuam de pe
+        # importa tanto quanto dizer quais mudaram — senao "sem mudança" parece
+        # "não tem dado".
+        linhas += [
+            "<u>Refinamento</u> · <i>não executado</i>",
+            "    o arquivo de origem é o mesmo da carga anterior",
+            "",
+            f"<u>Tabelas</u> · mantidas como estavam, zona <code>{ZONA_ARMAZEM}</code>",
+        ]
+        for tabela in edicao["views"].values():
+            completo = f"nessie.refinamento.{tabela}"
+            antes = anteriores.get(completo)
+            linhas.append(f"    ◦ <code>{html.escape(tabela)}</code>"
+                          + (f" — {antes} linhas" if antes is not None else ""))
+    else:
+        linhas += [
+            "<u>Refinamento</u> · Spark",
+            f"    notebook · <code>{html.escape(edicao['notebook'])}</code>",
+            "",
+            f"<u>Tabelas</u> · Iceberg, zona <code>{ZONA_ARMAZEM}</code>, catálogo Nessie",
+        ]
+        # Percorre as tabelas DESTA edicao na ordem declarada, nao a ordem
+        # alfabetica do manifesto: assim a principal (`_fases`) nao cai no meio.
+        for tabela in edicao["views"].values():
+            completo = f"nessie.refinamento.{tabela}"
+            if completo not in publicadas:
+                linhas.append(
+                    f"    ✗ <code>{html.escape(tabela)}</code> — não publicada nesta carga")
+                continue
+            n = publicadas[completo]
+            linhas.append(f"    • <code>{html.escape(tabela)}</code> — {n} linhas"
+                          + _variacao(n, anteriores.get(completo)))
 
     caminho = " › ".join(PASTA_VIEWS[1:] + [edicao["pasta"]])
     linhas += [
@@ -370,14 +441,30 @@ def _mensagem(estado: dict, anteriores: dict[str, int]) -> str:
     """
     etapas = estado.get("etapas") or {}
     origem = estado.get("origem", "")
+    puladas = estado.get("puladas") or []
+    atualizadas = len(EDICOES) - len(puladas)
+    # O titulo diz de cara se houve dado novo: uma carga que nao mudou nada e o
+    # caso comum, e ler "dados atualizados" todo dia sem nada ter mudado
+    # ensinaria a ignorar o aviso.
+    if atualizadas == 0:
+        titulo = "🔵 <b>Painel SEMARH — nada novo na origem</b>"
+    elif puladas:
+        titulo = (f"🟢 <b>Painel SEMARH — {atualizadas} de {len(EDICOES)} "
+                  "edições atualizadas</b>")
+    else:
+        titulo = "🟢 <b>Painel SEMARH — dados atualizados</b>"
     cabecalho = [
-        "🟢 <b>Painel SEMARH — dados atualizados</b>",
+        titulo,
         f"<i>{_por_extenso(estado['atualizado_em'])} · carga {origem} · "
         f"{_duracao(estado.get('duracao_s'))}</i>",
     ]
     # Uma etapa que falhou nao derruba a carga (o dado ja esta publicado), mas
     # nao pode passar despercebida no meio da mensagem: vai logo no topo.
-    problemas = [nome for nome, situacao in etapas.items() if situacao != "ok"]
+    # Convencao de `etapas`: "ok", "falhou: ..." ou um texto informativo. So o
+    # prefixo "falhou" e problema — sem isso, uma etapa que apenas RELATA algo
+    # (quantas edicoes foram puladas) viraria alarme falso todo dia.
+    problemas = [nome for nome, situacao in etapas.items()
+                 if str(situacao).startswith("falhou")]
     if problemas:
         cabecalho.append(f"⚠️ <b>Com ressalvas:</b> {', '.join(problemas)} — veja os logs.")
 
@@ -398,8 +485,9 @@ def _mensagem(estado: dict, anteriores: dict[str, int]) -> str:
         "",
         "━━━━━━━━━━━━━━━━━━",
         "",
-        "<i>Toda carga reescreve as tabelas por inteiro e recria as views; o número em "
-        "negrito é a variação de linhas desde a carga anterior.</i>",
+        "<i>Só é reprocessada a edição cujo arquivo de origem mudou; a gravação dessa edição "
+        "é integral, e o número em negrito é a variação de linhas desde a última vez que a "
+        "tabela foi escrita. As views são recriadas sempre — é metadado, não copia dado.</i>",
     ]
     if estado.get("novidades"):
         rodape += ["", "🔎 <b>Novidades no ambiente</b>",
@@ -443,21 +531,49 @@ def atualizar(self, forcar: bool = False) -> dict:
         except Exception as erro:  # nao aborta: o refinamento le do MinIO, nao do Dremio
             falhas_refresh.append(f"{fonte}: {erro}"[:150])
             log.warning("refresh de metadados falhou em %s (segue mesmo assim): %s", fonte, erro)
-    etapas["dremio_refresh"] = "; ".join(falhas_refresh)[:300] if falhas_refresh else "ok"
+    etapas["dremio_refresh"] = (f"falhou: {'; '.join(falhas_refresh)}"[:300]
+                                if falhas_refresh else "ok")
     progresso(20, "Lendo os datasets da zona de entrada")
 
-    # 2. dataframe + analise: os MESMOS notebooks que rodam no JupyterLab, um
+    # 2. quem mudou? A gravacao Iceberg e integral (`createOrReplace`), entao
+    # reprocessar uma edicao intacta escreve mais uma copia inteira da tabela no
+    # `armazem` sem trocar um byte de conteudo. Uma edicao encerrada (2025) faria
+    # isso todo dia, para sempre. Comparando a assinatura do arquivo de origem,
+    # so roda o notebook de quem realmente recebeu arquivo novo.
+    #
+    # O botao "Atualizar agora" do painel manda `forcar=True` e refaz tudo — e a
+    # saida para quando alguem quer reprocessar sem trocar o arquivo.
+    estado_anterior = _ler_estado()
+    impressoes = _impressao_origem()
+    origens_antes = estado_anterior.get("origens") or {}
+    conexao_checagem = _conexao_dremio()
+
+    a_processar, pulados = [], []
+    for edicao in EDICOES:
+        assinatura = impressoes.get(edicao["arquivo"])
+        inalterada = bool(assinatura) and assinatura == origens_antes.get(edicao["arquivo"])
+        if not forcar and inalterada and _tabelas_no_lugar(conexao_checagem, edicao):
+            pulados.append(edicao["titulo"])
+        else:
+            a_processar.append(edicao)
+    if pulados:
+        log.info("origem sem mudança, edições puladas: %s", ", ".join(pulados))
+    etapas["origens"] = (f"{len(a_processar)} processada(s), {len(pulados)} sem mudança"
+                         if pulados else f"{len(a_processar)} processada(s)")
+
+    # 3. dataframe + analise: os MESMOS notebooks que rodam no JupyterLab, um
     # por edicao. Rodam em sequencia porque cada um sobe o seu driver Spark.
-    estimativa = float(_ler_estado().get("duracao_s") or 90)
+    estimativa = float(estado_anterior.get("duracao_s") or 90)
     # Os notebooks anotam aqui cada tabela que publicarem (ver lakehouse.gravar).
     manifesto = ARQUIVO_ESTADO.parent / f".manifesto-{self.request.id}.jsonl"
     falhou = None
-    for indice, notebook in enumerate(NOTEBOOKS):
-        # A barra cobre os 70 pontos divididos entre os notebooks; dentro de cada
-        # fatia ela anda pelo tempo decorrido, com a duracao da carga anterior
-        # como estimativa.
-        base = 20 + int(70 * indice / len(NOTEBOOKS))
-        fatia = 70 / len(NOTEBOOKS)
+    for indice, edicao in enumerate(a_processar):
+        notebook = edicao["notebook"]
+        # A barra cobre os 70 pontos divididos entre os notebooks a rodar; dentro
+        # de cada fatia ela anda pelo tempo decorrido, com a duracao da carga
+        # anterior como estimativa.
+        base = 20 + int(70 * indice / len(a_processar))
+        fatia = 70 / len(a_processar)
         comeco = time.monotonic()
         with tempfile.TemporaryDirectory() as tmp:
             processo = subprocess.Popen(
@@ -469,7 +585,7 @@ def atualizar(self, forcar: bool = False) -> dict:
             )
             while processo.poll() is None:
                 decorrido = time.monotonic() - comeco
-                fracao = min(decorrido / max(estimativa / len(NOTEBOOKS), 1), 1.0)
+                fracao = min(decorrido / max(estimativa / len(a_processar), 1), 1.0)
                 progresso(base + int(fatia * fracao),
                           f"Refinando os dados no Spark ({Path(notebook).stem})")
                 time.sleep(2)
@@ -504,10 +620,12 @@ def atualizar(self, forcar: bool = False) -> dict:
             evento="falha",
         )
         raise RuntimeError(f"notebook de refinamento {notebook} falhou:\n{cauda}")
-    etapas["refinamento"] = "ok"
+    # "ok" so quando algo rodou de fato — dizer "ok" para uma etapa que nao
+    # executou esconde justamente o que a carga pulada precisa deixar claro.
+    etapas["refinamento"] = "ok" if a_processar else "não executado (nada novo)"
     tabelas = _ler_manifesto(manifesto)
 
-    # 3. views curadas: o caminho pelo qual o painel enxerga o dado. Vem DEPOIS
+    # 4. views curadas: o caminho pelo qual o painel enxerga o dado. Vem DEPOIS
     # do refinamento (as tabelas ja existem) e ANTES da conferencia, que passa
     # por elas de proposito.
     progresso(90, "Publicando as views no Dremio")
@@ -520,7 +638,7 @@ def atualizar(self, forcar: bool = False) -> dict:
         etapas["views"] = f"falhou: {erro}"[:300]
         log.warning("não consegui recriar as views curadas: %s", erro)
 
-    # 4. confere e carimba — o carimbo e a chave de cache do dashboard.
+    # 5. confere e carimba — o carimbo e a chave de cache do dashboard.
     progresso(92, "Conferindo as tabelas publicadas")
     linhas = None
     linhas_origem: dict[str, int] = {}
@@ -535,10 +653,15 @@ def atualizar(self, forcar: bool = False) -> dict:
     except Exception as erro:
         etapas["conferencia"] = f"falhou: {erro}"[:300]
 
-    # Linhas de cada tabela na carga anterior — vira a variacao na mensagem.
-    anteriores = {t["tabela"]: t["linhas"] for t in (_ler_estado().get("tabelas") or [])}
+    # Ultima contagem conhecida de CADA tabela, nao so as desta carga: com o
+    # pulo, uma edicao intacta some do manifesto por varias cargas seguidas, e
+    # sem este acumulado a notificacao deixaria de saber quantas linhas ela tem.
+    # A variacao tambem passa a ser contra a ultima vez que a tabela mudou.
+    anteriores = dict(estado_anterior.get("linhas_tabelas") or {})
+    if not anteriores:  # primeira carga apos a mudanca: reaproveita o formato antigo
+        anteriores = {t["tabela"]: t["linhas"] for t in (estado_anterior.get("tabelas") or [])}
 
-    # 5. varredura do ambiente: o que mudou no Dremio e no MinIO desde a carga
+    # 6. varredura do ambiente: o que mudou no Dremio e no MinIO desde a carga
     # anterior — inclusive coisa criada por fora do pipeline.
     progresso(96, "Varrendo o catálogo")
     try:
@@ -556,7 +679,15 @@ def atualizar(self, forcar: bool = False) -> dict:
         "iniciado_em": agora.isoformat(timespec="seconds"),
         "duracao_s": round(time.monotonic() - inicio, 1),
         "edicoes": [{"titulo": e["titulo"], "arquivo": e["arquivo"]} for e in EDICOES],
+        # Assinatura de cada origem: e o que a proxima carga compara para saber
+        # se ha arquivo novo. So e gravada quando a carga fecha bem — se um
+        # notebook falhar, a assinatura antiga fica e a proxima tenta de novo.
+        "origens": {**origens_antes, **impressoes},
+        "puladas": pulados,
         "tabelas": tabelas,
+        # Acumulado de "quantas linhas cada tabela tinha da ultima vez que foi
+        # escrita" — sobrevive as cargas em que a edicao e pulada.
+        "linhas_tabelas": {**anteriores, **{t["tabela"]: t["linhas"] for t in tabelas}},
         "linhas": linhas,
         "linhas_origem": linhas_origem,
         "origem": "manual" if forcar else "automática",

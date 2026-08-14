@@ -578,16 +578,19 @@ O que a tarefa faz:
 
 1. **Datasets** — `ALTER TABLE … REFRESH METADATA` nos parquets da zona de entrada, para o Dremio
    enxergar um arquivo novo publicado no MinIO.
-2. **DataFrame + análise** — reexecuta os **mesmos notebooks** de refinamento que uma pessoa roda no
+2. **Quem mudou** — compara a assinatura (ETag + tamanho, via `head_object`, sem baixar nada) do
+   arquivo de origem de cada edição com a da carga anterior. **Só entra na etapa seguinte a edição
+   que recebeu arquivo novo.**
+3. **DataFrame + análise** — reexecuta os **mesmos notebooks** de refinamento que uma pessoa roda no
    JupyterLab, **um por edição** do Selo Ambiental (`semarh_painel/refinamento_selo_ambiental.ipynb`
    e `..._2025.ipynb`), regravando as tabelas de `refinamento` e os resumos. Não há lógica duplicada
    entre os notebooks e a tarefa — se as validações de **qualquer** um falharem, a tarefa falha e
    **as tabelas antigas continuam no ar**; nada é publicado pela metade.
-3. **Views** — recria as views curadas do space `refinamento` (pastas pela API REST, views por SQL).
+4. **Views** — recria as views curadas do space `refinamento` (pastas pela API REST, views por SQL).
    São elas que o painel consulta, então recriar a cada carga faz a estrutura se curar sozinha: uma
    view apagada por engano volta na execução seguinte. A conferência logo abaixo passa por elas de
    propósito.
-4. **Dashboard** — grava o carimbo em `/estado/atualizacao.json` (volume `painel-estado`,
+5. **Dashboard** — grava o carimbo em `/estado/atualizacao.json` (volume `painel-estado`,
    compartilhado com o serviço `dashboard`). O Streamlit usa esse carimbo como chave de cache:
    o dado novo aparece assim que o refinamento termina, sem esperar o TTL de 5 min.
 
@@ -664,11 +667,39 @@ Se alguma etapa falhar sem derrubar a carga (as views não recriadas, por exempl
 `⚠️ Com ressalvas: …` entra logo no cabeçalho, e não perdido no meio do texto.
 
 As tabelas listadas foram **reescritas naquela execução** — o manifesto é criado, lido e apagado a
-cada carga, então nada ali é herança de execução anterior. Como a gravação é integral
-(`createOrReplace`), elas são reescritas mesmo quando o conteúdo não muda; é por isso que o bucket
-`armazem` cresce alguns arquivos Iceberg a cada carga, e é a variação em negrito que diz se o
-conteúdo mudou de tamanho. Tabela publicada por um notebook fora das edições registradas não some da
-mensagem: cai numa seção **Outras tabelas publicadas**.
+cada carga, então nada ali é herança de execução anterior. Tabela publicada por um notebook fora das
+edições registradas não some da mensagem: cai numa seção **Outras tabelas publicadas**.
+
+### Só reprocessa o que mudou
+
+A gravação Iceberg é **integral** (`createOrReplace`): cada carga escreve uma cópia inteira da
+tabela no `armazem`, mesmo quando nenhum byte mudou. Numa edição encerrada — a de 2025 não recebe
+mais arquivo — isso significaria uma cópia nova por dia, para sempre. O efeito era medível: as
+tabelas do painel já tinham acumulado **273 cópias** de 224–672 linhas cada.
+
+Por isso a etapa 2 compara a assinatura do arquivo de origem e **pula a edição intacta**:
+
+| Situação | O que acontece | Tempo |
+|---|---|---|
+| As duas edições com arquivo novo | roda os dois notebooks | ~85 s |
+| Só uma com arquivo novo | roda só o notebook dela | ~36 s |
+| Nenhuma mudou | não roda notebook nenhum | **~3 s** |
+
+O que **continua acontecendo em toda carga**, mudando ou não: o refresh de metadados no Dremio, a
+recriação das views (metadado, não copia dado — é o que mantém a estrutura se curando sozinha), a
+conferência e a varredura do ambiente.
+
+Três garantias para pular não virar risco:
+
+- **O botão "Atualizar dados agora" força tudo.** Ele manda `forcar=True`, então dá para reprocessar
+  sem precisar mexer no arquivo de origem.
+- **Tabela sumida cancela o pulo.** Antes de pular, a tarefa confere se as tabelas daquela edição
+  respondem. Se alguém apagou uma por fora, a edição é reprocessada mesmo com a origem intacta.
+- **Falha não confirma a assinatura.** A assinatura nova só é gravada quando a carga fecha bem; se
+  um notebook falhar, a origem continua marcada como pendente e a próxima carga tenta de novo.
+
+Reenviar o **mesmo** arquivo por cima não conta como mudança — a assinatura é do conteúdo (ETag),
+não da data de upload.
 
 A mensagem é fatiada automaticamente se passar do limite de 4096 caracteres do Telegram, sempre
 quebrando entre linhas — cortar no meio partiria uma tag HTML e o Telegram recusaria o envio inteiro.
