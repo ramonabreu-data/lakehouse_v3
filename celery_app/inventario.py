@@ -125,17 +125,50 @@ def coletar(conexao) -> dict:
     return foto
 
 
-def _lista(itens: list[str]) -> str:
-    if len(itens) <= MAX_CITADOS:
-        return ", ".join(itens)
-    return ", ".join(itens[:MAX_CITADOS]) + f" (+{len(itens) - MAX_CITADOS})"
+def _prefixo_comum(itens: list[str], separador: str) -> str:
+    """Trecho inicial que TODOS compartilham — vira o cabeçalho do grupo.
+
+    Oito caminhos de 100 caracteres numa linha só são ilegíveis, e quase tudo
+    ali é o mesmo prefixo repetido. Fatorando-o, sobra o que de fato distingue
+    um item do outro. Nunca engole um item inteiro: se todos forem iguais até o
+    fim, o último nível fica com os itens.
+    """
+    if len(itens) < 2:
+        return ""
+    partes = [item.split(separador) for item in itens]
+    comum: list[str] = []
+    for nivel in zip(*partes):
+        if len(set(nivel)) != 1:
+            break
+        comum.append(nivel[0])
+    if len(comum) >= min(len(p) for p in partes):
+        comum.pop()
+    return separador.join(comum)
 
 
-def diferencas(antes: dict, depois: dict) -> list[str]:
-    """O que entrou e o que saiu entre duas fotos, em frases curtas."""
+def _grupo(titulo: str, itens: list[str], separador: str = ".") -> dict:
+    """Uma novidade: título, prefixo comum fatorado e os itens já encurtados.
+
+    Devolve estrutura, não frase pronta: quem exibe (a notificação) decide como
+    quebrar linha. Antes isto saía como uma string enorme com tudo separado por
+    vírgula, e era o trecho mais ilegível do aviso.
+    """
+    prefixo = _prefixo_comum(itens, separador)
+    corte = len(prefixo) + len(separador) if prefixo else 0
+    curtos = [item[corte:] for item in itens]
+    return {
+        "titulo": titulo,
+        "prefixo": prefixo,
+        "itens": curtos[:MAX_CITADOS],
+        "restantes": max(0, len(curtos) - MAX_CITADOS),
+    }
+
+
+def diferencas(antes: dict, depois: dict) -> list[dict]:
+    """O que entrou e o que saiu entre duas fotos, agrupado para exibição."""
     if not antes or not depois:
         return []
-    mudancas: list[str] = []
+    mudancas: list[dict] = []
 
     # Secao ausente na foto anterior = primeira varredura daquela dimensao.
     # Sem esse cuidado, estrear uma varredura nova anunciaria o ambiente
@@ -150,9 +183,9 @@ def diferencas(antes: dict, depois: dict) -> list[str]:
             continue
         entraram, sairam = sorted(novos - velhos), sorted(velhos - novos)
         if entraram:
-            mudancas.append(f"Dremio: +{len(entraram)} {rotulo} — {_lista(entraram)}")
+            mudancas.append(_grupo(f"Dremio · +{len(entraram)} {rotulo}", entraram))
         if sairam:
-            mudancas.append(f"Dremio: −{len(sairam)} {rotulo} — {_lista(sairam)}")
+            mudancas.append(_grupo(f"Dremio · −{len(sairam)} {rotulo}", sairam))
 
     b_antes, b_depois = antes.get("bancos") or {}, depois.get("bancos") or {}
     if not b_antes:
@@ -162,9 +195,9 @@ def diferencas(antes: dict, depois: dict) -> list[str]:
         novas = set(b_depois.get(banco) or {})
         entraram, sairam = sorted(novas - velhas), sorted(velhas - novas)
         if entraram:
-            mudancas.append(f"{banco}: +{len(entraram)} tabela(s) — {_lista(entraram)}")
+            mudancas.append(_grupo(f"{banco} · +{len(entraram)} tabela(s)", entraram))
         if sairam:
-            mudancas.append(f"{banco}: −{len(sairam)} tabela(s) — {_lista(sairam)}")
+            mudancas.append(_grupo(f"{banco} · −{len(sairam)} tabela(s)", sairam))
 
     m_antes, m_depois = antes.get("minio") or {}, depois.get("minio") or {}
     if not m_antes:
@@ -172,20 +205,24 @@ def diferencas(antes: dict, depois: dict) -> list[str]:
     for bucket in sorted(set(m_antes) | set(m_depois)):
         velho, novo = m_antes.get(bucket), m_depois.get(bucket)
         if velho is None:
-            mudancas.append(f"MinIO: bucket novo `{bucket}` ({novo['objetos']} arquivos)")
+            mudancas.append(_grupo(f"MinIO · bucket novo {bucket}",
+                                   [f"{novo['objetos']} arquivos"]))
             continue
         if novo is None:
-            mudancas.append(f"MinIO: bucket removido `{bucket}`")
+            mudancas.append(_grupo(f"MinIO · bucket removido {bucket}", []))
             continue
         arq_velho, arq_novo = set(velho.get("arquivos") or []), set(novo.get("arquivos") or [])
         entraram, sairam = sorted(arq_novo - arq_velho), sorted(arq_velho - arq_novo)
         if entraram:
-            mudancas.append(f"MinIO `{bucket}`: +{len(entraram)} arquivo(s) — {_lista(entraram)}")
+            mudancas.append(_grupo(f"MinIO {bucket} · +{len(entraram)} arquivo(s)",
+                                   entraram, separador="/"))
         if sairam:
-            mudancas.append(f"MinIO `{bucket}`: −{len(sairam)} arquivo(s) — {_lista(sairam)}")
+            mudancas.append(_grupo(f"MinIO {bucket} · −{len(sairam)} arquivo(s)",
+                                   sairam, separador="/"))
         # Buckets grandes (sem lista de arquivos) entram pelo agregado.
         if not entraram and not sairam and velho["objetos"] != novo["objetos"]:
             delta = novo["objetos"] - velho["objetos"]
-            mudancas.append(f"MinIO `{bucket}`: {delta:+d} arquivo(s), "
-                            f"agora {novo['objetos']} ({novo['bytes'] / 1e6:.1f} MB)")
+            mudancas.append(_grupo(
+                f"MinIO {bucket} · {delta:+d} arquivo(s)",
+                [f"agora {novo['objetos']} arquivos ({novo['bytes'] / 1e6:.1f} MB)"]))
     return mudancas

@@ -576,7 +576,12 @@ e no que o painel exibe. Os serviços sobem com o `docker compose up -d`; não h
 | `celery-beat` | Agendador — publica a tarefa às 07:00 |
 | `celery-worker` | Executa a tarefa. Usa a **mesma imagem do Spark**, porque sobe um driver Spark |
 
-O que a tarefa faz, em [`celery_app/tarefas.py`](celery_app/tarefas.py):
+Tudo que uma edição do Selo Ambiental tem — arquivo de origem, dataset no Dremio, notebook, tabelas
+e views — é declarado num item da lista `EDICOES`, em [`celery_app/tarefas.py`](celery_app/tarefas.py).
+**Acrescentar uma edição é acrescentar um item ali**: a carga passa a rodar o notebook dela, criar a
+pasta e as views, e a notificação ganha a seção correspondente, sem mais nenhuma alteração.
+
+O que a tarefa faz:
 
 1. **Datasets** — `ALTER TABLE … REFRESH METADATA` nos parquets da zona de entrada, para o Dremio
    enxergar um arquivo novo publicado no MinIO.
@@ -584,9 +589,7 @@ O que a tarefa faz, em [`celery_app/tarefas.py`](celery_app/tarefas.py):
    JupyterLab, **um por edição** do Selo Ambiental (`semarh_painel/refinamento_selo_ambiental.ipynb`
    e `..._2025.ipynb`), regravando as tabelas de `refinamento` e os resumos. Não há lógica duplicada
    entre os notebooks e a tarefa — se as validações de **qualquer** um falharem, a tarefa falha e
-   **as tabelas antigas continuam no ar**; nada é publicado pela metade. Os notebooks a rodar saem
-   de `NOTEBOOK_REFINAMENTO` (lista separada por vírgula), então uma edição nova entra na carga
-   diária sem mexer no código da tarefa.
+   **as tabelas antigas continuam no ar**; nada é publicado pela metade.
 3. **Views** — recria as views curadas do space `refinamento` (pastas pela API REST, views por SQL).
    São elas que o painel consulta, então recriar a cada carga faz a estrutura se curar sozinha: uma
    view apagada por engano volta na execução seguinte. A conferência logo abaixo passa por elas de
@@ -617,39 +620,65 @@ Toda carga — automática ou manual — gera três registros:
    tabelas publicadas com a contagem de linhas). É o que o painel lê para o `🕒 Atualizado em`.
 2. **`/estado/historico.jsonl`** — uma linha por execução, append-only. Aparece na sidebar em
    **Histórico**: quando · situação · origem · tabelas atualizadas.
-3. **Mensagem no Telegram** — curta, só o que foi publicado:
+3. **Mensagem no Telegram** — uma seção por edição, cada uma seguindo o caminho do dado:
 
 ```
-🟢 Dados atualizados
-quinta, 13/08/2026 às 13:07
+🟢 Painel SEMARH — dados atualizados
+sexta, 14/08/2026 às 11:04 · carga automática · 3min 54s
 
-📥 Origem — MinIO, zona entrada
-• sermarh_painel/selo_ambiental_2026.parquet — 224 linhas
-  no Dremio: minio.entrada."sermarh_painel"."selo_ambiental_2026.parquet"
-• sermarh_painel/selo_ambiental_2025.parquet — 224 linhas
-  no Dremio: minio.entrada."sermarh_painel"."selo_ambiental_2025.parquet"
+━━━━━━━━━━━━━━━━━━
 
-📦 Tabelas reescritas — Iceberg na zona armazem do MinIO, catálogo Nessie:
-• nessie.refinamento.semarh_painel — 224 linhas
-• nessie.refinamento.semarh_painel_2025 — 224 linhas
-• nessie.refinamento.semarh_painel_2025_fases — 672 linhas
-• nessie.refinamento.semarh_painel_2025_por_criterios — 11 linhas
-• nessie.refinamento.semarh_painel_2025_por_selo — 5 linhas
-• nessie.refinamento.semarh_painel_fases — 672 linhas
-• nessie.refinamento.semarh_painel_por_criterios — 11 linhas
-• nessie.refinamento.semarh_painel_por_selo — 5 linhas
+▊ Selo Ambiental 2026
 
-Toda carga reescreve as tabelas por inteiro; o número entre parênteses é a
-variação de linhas desde a carga anterior.
+Origem · MinIO, zona entrada
+    arquivo · sermarh_painel/selo_ambiental_2026.parquet — 224 linhas
+    dataset · minio.entrada."sermarh_painel"."selo_ambiental_2026.parquet"
+
+Refinamento · Spark
+    notebook · semarh_painel/refinamento_selo_ambiental.ipynb
+
+Tabelas · Iceberg, zona armazem, catálogo Nessie
+    • semarh_painel — 224 linhas
+    • semarh_painel_fases — 672 linhas
+    • semarh_painel_por_selo — 5 linhas
+    • semarh_painel_por_criterios — 11 linhas
+
+Views · space refinamento
+    semarh_painel › chefia_gabinete › selos_ambientais › selos_ambientais_2026
+    • selo_ambiental
+    • selo_ambiental_fases  ← lida pelo painel
+    • por_tipo_de_selo
+    • por_criterios_atendidos
+
+━━━━━━━━━━━━━━━━━━
+
+▊ Selo Ambiental 2025
+     (mesma estrutura, com os caminhos de 2025)
+
+━━━━━━━━━━━━━━━━━━
+
+Toda carga reescreve as tabelas por inteiro e recria as views; o número em
+negrito é a variação de linhas desde a carga anterior.
 ```
 
-Cada bloco diz **onde o dado mora**: o arquivo de origem fica no MinIO (zona `entrada`) e é servido
-pelo Dremio com outro nome; as tabelas são Iceberg na zona `armazem`, catalogadas no Nessie e
-consultadas no Dremio como `nessie.refinamento.*`. As tabelas listadas foram **reescritas naquela
-execução** — o manifesto é criado, lido e apagado a cada carga, então nada ali é herança de execução
-anterior. Como a gravação é integral (`createOrReplace`), elas são reescritas mesmo quando o
-conteúdo não muda; é por isso que o bucket `armazem` cresce alguns arquivos Iceberg a cada carga, e
-é a variação entre parênteses que diz se o conteúdo mudou de tamanho.
+**A ordem das subseções é a ordem em que o dado anda** — arquivo no MinIO → dataset promovido no
+Dremio → notebook no Spark → tabela Iceberg no Nessie → view no space. Quem lê de cima para baixo lê
+o pipeline, e o mesmo dado aparece com quatro nomes diferentes ao longo do caminho: é justamente
+isso que a mensagem existe para desambiguar. A view marcada com `← lida pelo painel` é a que não
+pode quebrar.
+
+Se alguma etapa falhar sem derrubar a carga (as views não recriadas, por exemplo), um aviso
+`⚠️ Com ressalvas: …` entra logo no cabeçalho, e não perdido no meio do texto.
+
+As tabelas listadas foram **reescritas naquela execução** — o manifesto é criado, lido e apagado a
+cada carga, então nada ali é herança de execução anterior. Como a gravação é integral
+(`createOrReplace`), elas são reescritas mesmo quando o conteúdo não muda; é por isso que o bucket
+`armazem` cresce alguns arquivos Iceberg a cada carga, e é a variação em negrito que diz se o
+conteúdo mudou de tamanho. Tabela publicada por um notebook fora das edições registradas não some da
+mensagem: cai numa seção **Outras tabelas publicadas**.
+
+A mensagem é fatiada automaticamente se passar do limite de 4096 caracteres do Telegram, sempre
+quebrando entre linhas — cortar no meio partiria uma tag HTML e o Telegram recusaria o envio inteiro.
 
 Além do que a carga publica, cada execução faz uma **varredura do ambiente** e avisa o que mudou
 desde a carga anterior — inclusive coisa criada por fora do pipeline:

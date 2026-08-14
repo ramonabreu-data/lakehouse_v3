@@ -29,6 +29,9 @@ log = logging.getLogger(__name__)
 
 API = "https://api.telegram.org/bot{token}/{metodo}"
 TIMEOUT = 15
+# O Telegram recusa mensagem acima de 4096 caracteres. A margem cobre o rodapé
+# de continuação que `_fatiar` acrescenta.
+LIMITE = 3900
 
 
 def _token() -> str:
@@ -79,6 +82,28 @@ def _chamar(metodo: str, **dados) -> dict:
     return corpo["result"]
 
 
+def _fatiar(texto: str) -> list[str]:
+    """Divide em mensagens dentro do limite do Telegram, quebrando em LINHAS.
+
+    Cortar no meio de uma linha partiria uma tag HTML (`<code>` sem `</code>`) e
+    o Telegram recusaria a mensagem inteira. Uma linha sozinha maior que o
+    limite e improvavel aqui — se acontecer, vai inteira e o proprio Telegram
+    reclama, que e melhor do que enviar HTML quebrado em silencio.
+    """
+    if len(texto) <= LIMITE:
+        return [texto]
+    partes, atual = [], []
+    for linha in texto.split("\n"):
+        if atual and sum(len(x) + 1 for x in atual) + len(linha) > LIMITE:
+            partes.append("\n".join(atual))
+            atual = []
+        atual.append(linha)
+    if atual:
+        partes.append("\n".join(atual))
+    total = len(partes)
+    return [f"{p}\n\n<i>({i}/{total})</i>" for i, p in enumerate(partes, 1)]
+
+
 def enviar(texto: str, evento: str = "sucesso") -> bool:
     """Manda a mensagem a todos os destinos configurados.
 
@@ -89,15 +114,17 @@ def enviar(texto: str, evento: str = "sucesso") -> bool:
         return False
     entregues = 0
     for chat, topico in _chats():
-        dados = {"chat_id": chat, "text": texto,
-                 "parse_mode": "HTML", "disable_web_page_preview": True}
-        if topico is not None:
-            dados["message_thread_id"] = topico
-        try:
-            _chamar("sendMessage", **dados)
-            entregues += 1
-        except Exception as erro:
-            log.warning("não foi possível notificar %s no Telegram: %s", chat, erro)
+        for pedaco in _fatiar(texto):
+            dados = {"chat_id": chat, "text": pedaco,
+                     "parse_mode": "HTML", "disable_web_page_preview": True}
+            if topico is not None:
+                dados["message_thread_id"] = topico
+            try:
+                _chamar("sendMessage", **dados)
+                entregues += 1
+            except Exception as erro:
+                log.warning("não foi possível notificar %s no Telegram: %s", chat, erro)
+                break
     return entregues > 0
 
 

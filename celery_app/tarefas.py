@@ -58,71 +58,79 @@ def _lista(bruto: str) -> list[str]:
     return [item.strip() for item in bruto.split(",") if item.strip()]
 
 
-# Um notebook por edicao do Selo Ambiental. Cada um regrava as suas tabelas; a
-# carga so termina bem se TODOS passarem, entao uma edicao com dado inconsistente
-# nao deixa o painel meio atualizado.
-NOTEBOOKS = _lista(os.getenv(
-    "NOTEBOOK_REFINAMENTO",
-    "semarh_painel/refinamento_selo_ambiental.ipynb,"
-    "semarh_painel/refinamento_selo_ambiental_2025.ipynb",
-))
-ARQUIVO_ESTADO = Path(os.getenv("ARQUIVO_ESTADO", "/estado/atualizacao.json"))
+                                                                                                                                                                                                                                                                                                                                                                                ARQUIVO_ESTADO = Path(os.getenv("ARQUIVO_ESTADO", "/estado/atualizacao.json"))
 # Observabilidade: uma linha JSON por execucao, append-only. E a fonte do
 # historico que aparece no painel e do "o que mudou" da notificacao.
 ARQUIVO_HISTORICO = Path(os.getenv("ARQUIVO_HISTORICO", "/estado/historico.jsonl"))
-# Nomes amigaveis dos datasets de origem, so para a mensagem.
-DATASETS = _lista(os.getenv(
-    "DATASET_ORIGEM",
-    "sermarh_painel/selo_ambiental_2026.parquet,sermarh_painel/selo_ambiental_2025.parquet",
-))
 # Zonas do object store, so para dizer ONDE cada coisa mora na mensagem.
 ZONA_ENTRADA = os.getenv("ZONA_ENTRADA", "entrada")
 ZONA_ARMAZEM = os.getenv("ZONA_ARMAZEM", "armazem")
 VARS_ENV = Path(os.getenv("VARS_ENV", "/opt/painel/vars.env"))
-# Fontes brutas no Dremio (os parquets da zona de entrada, promovidos como
-# dataset). Na mesma ordem de DATASETS.
-FONTES_BRUTAS = _lista(os.getenv(
-    "FONTE_BRUTA_DREMIO",
-    'minio.entrada."sermarh_painel"."selo_ambiental_2026.parquet",'
-    'minio.entrada."sermarh_painel"."selo_ambiental_2025.parquet"',
-))
+
 # --------------------------------------------------------------------------
-# Views curadas no space `refinamento` — a interface que o painel consulta
+# As edicoes do Selo Ambiental — a UNICA fonte de verdade do pipeline
 # --------------------------------------------------------------------------
-# O Streamlit NAO le a tabela Iceberg direto: le estas views. Assim o nome
-# fisico no Nessie (achatado, `semarh_painel_2025_fases`) pode mudar sem tocar
-# no codigo do painel — a view e o contrato, a tabela e o detalhe.
+# Cada edicao descreve o caminho inteiro do seu dado, do arquivo no MinIO ate a
+# view que o painel le. Antes isto eram tres listas paralelas (notebooks,
+# arquivos, datasets) mantidas alinhadas por POSICAO — dava para trocar uma sem
+# trocar a outra, e a notificacao so sabia listar tudo achatado, sem dizer o que
+# pertencia a que edicao. Com a edicao como unidade, a mensagem sai organizada
+# de graca e acrescentar uma edicao e acrescentar um item aqui.
 #
-# Por isso a carga as recria toda vez: uma view apagada por engano volta na
-# proxima execucao, e a estrutura de pastas deixa de depender de alguem ter
-# criado na mao. `CREATE OR REPLACE` sobre uma view que ja aponta para a mesma
-# tabela nao muda nada, entao repetir e barato e seguro.
-#
-# As pastas espelham a navegacao do painel: setor -> familia de BI -> edicao.
-# Quem carrega o ano e a PASTA, entao os nomes das views se repetem nas duas.
-PASTA_VIEWS = _lista(os.getenv(
-    "PASTA_VIEWS_DREMIO",
-    "refinamento,semarh_painel,chefia_gabinete,selos_ambientais",
-))
-VIEWS = {
-    "selos_ambientais_2026": {
-        "selo_ambiental": "semarh_painel",
-        "selo_ambiental_fases": "semarh_painel_fases",
-        "por_tipo_de_selo": "semarh_painel_por_selo",
-        "por_criterios_atendidos": "semarh_painel_por_criterios",
+# `views` mapeia nome da view -> tabela Iceberg no Nessie que ela expoe. As
+# pastas espelham a navegacao do painel (setor -> familia de BI -> edicao), e
+# quem carrega o ano e a PASTA: por isso os nomes das views se repetem.
+PASTA_VIEWS = ["refinamento", "semarh_painel", "chefia_gabinete", "selos_ambientais"]
+
+EDICOES = [
+    {
+        "titulo": "Selo Ambiental 2026",
+        "pasta": "selos_ambientais_2026",
+        "notebook": "semarh_painel/refinamento_selo_ambiental.ipynb",
+        "arquivo": "sermarh_painel/selo_ambiental_2026.parquet",
+        "dataset": 'minio.entrada."sermarh_painel"."selo_ambiental_2026.parquet"',
+        "views": {
+            "selo_ambiental": "semarh_painel",
+            "selo_ambiental_fases": "semarh_painel_fases",
+            "por_tipo_de_selo": "semarh_painel_por_selo",
+            "por_criterios_atendidos": "semarh_painel_por_criterios",
+        },
+        # A view que a aba do painel consulta — sinalizada na notificacao para
+        # quem for mexer saber qual delas nao pode quebrar.
+        "principal": "selo_ambiental_fases",
     },
-    "selos_ambientais_2025": {
-        "selo_ambiental": "semarh_painel_2025",
-        "selo_ambiental_fases": "semarh_painel_2025_fases",
-        "por_tipo_de_selo": "semarh_painel_2025_por_selo",
-        "por_criterios_atendidos": "semarh_painel_2025_por_criterios",
+    {
+        "titulo": "Selo Ambiental 2025",
+        "pasta": "selos_ambientais_2025",
+        "notebook": "semarh_painel/refinamento_selo_ambiental_2025.ipynb",
+        "arquivo": "sermarh_painel/selo_ambiental_2025.parquet",
+        "dataset": 'minio.entrada."sermarh_painel"."selo_ambiental_2025.parquet"',
+        "views": {
+            "selo_ambiental": "semarh_painel_2025",
+            "selo_ambiental_fases": "semarh_painel_2025_fases",
+            "por_tipo_de_selo": "semarh_painel_2025_por_selo",
+            "por_criterios_atendidos": "semarh_painel_2025_por_criterios",
+        },
+        "principal": "selo_ambiental_fases",
     },
+]
+
+# Derivados — nada aqui se mantem na mao.
+# A carga so termina bem se TODOS os notebooks passarem: uma edicao com dado
+# inconsistente nao deixa o painel meio atualizado.
+NOTEBOOKS = [e["notebook"] for e in EDICOES]
+FONTES_BRUTAS = [e["dataset"] for e in EDICOES]
+# Tabela Iceberg -> edicao a que pertence. E o que permite agrupar o manifesto
+# (que vem achatado do `lakehouse.gravar`) por edicao na notificacao.
+EDICAO_DA_TABELA = {
+    f"nessie.refinamento.{tabela}": edicao["titulo"]
+    for edicao in EDICOES for tabela in edicao["views"].values()
 }
 # A conferencia final consulta pelo MESMO caminho que o painel usa — se a view
 # quebrar, a carga acusa em vez de deixar o painel cair sozinho depois.
 TABELA_CONFERE = os.getenv(
     "TABELA_CONFERE",
-    ".".join(PASTA_VIEWS + ["selos_ambientais_2026", "selo_ambiental_fases"]),
+    ".".join(PASTA_VIEWS + [EDICOES[0]["pasta"], EDICOES[0]["principal"]]),
 )
 
 DIAS = ("segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo")
@@ -234,10 +242,10 @@ def _garantir_views(conexao) -> None:
     # O primeiro nivel e o proprio space, que ja existe e nao se cria por aqui.
     for nivel in range(2, len(PASTA_VIEWS) + 1):
         criar_pasta(PASTA_VIEWS[:nivel])
-    for edicao, views in VIEWS.items():
-        criar_pasta(PASTA_VIEWS + [edicao])
-        for view, tabela in views.items():
-            alvo = ".".join(PASTA_VIEWS + [edicao, view])
+    for edicao in EDICOES:
+        criar_pasta(PASTA_VIEWS + [edicao["pasta"]])
+        for view, tabela in edicao["views"].items():
+            alvo = ".".join(PASTA_VIEWS + [edicao["pasta"], view])
             conexao.toPandas(
                 f"CREATE OR REPLACE VIEW {alvo} AS "
                 f"SELECT * FROM nessie.refinamento.{tabela} AT BRANCH main"
@@ -290,48 +298,122 @@ def _ler_manifesto(caminho: Path) -> list[dict]:
     return sorted(tabelas.values(), key=lambda r: r["tabela"])
 
 
-def _mensagem(estado: dict, anteriores: dict[str, int]) -> str:
-    """Aviso do Telegram: o que foi publicado, ONDE mora e o que variou.
+def _duracao(segundos: float | None) -> str:
+    """90.4 -> "1min 30s" — a leitura e sempre "quanto demorou", nao "quantos s"."""
+    if not segundos:
+        return "—"
+    minutos, resto = divmod(int(segundos), 60)
+    return f"{minutos}min {resto:02d}s" if minutos else f"{resto}s"
 
-    "Onde" importa porque o mesmo dado aparece em três lugares com nomes
-    diferentes: o arquivo no MinIO, a tabela Iceberg no catálogo Nessie e o
-    caminho pelo qual o Dremio a serve.
+
+def _variacao(linhas: int, antes: int | None) -> str:
+    """" (+12)" desde a carga anterior; vazio se nao mudou ou se e a primeira."""
+    if antes is None or antes == linhas:
+        return ""
+    return f" <b>({linhas - antes:+d})</b>"
+
+
+def _bloco_edicao(edicao: dict, estado: dict, anteriores: dict[str, int]) -> list[str]:
+    """Uma seção da notificação: o caminho completo do dado de UMA edição.
+
+    A ordem das subseções é a ordem em que o dado anda — arquivo no MinIO →
+    dataset no Dremio → notebook no Spark → tabelas no Nessie → views no space.
+    Quem lê de cima para baixo lê o pipeline.
     """
     linhas_origem = estado.get("linhas_origem") or {}
-    partes = [
-        "🟢 <b>Dados atualizados</b>",
-        _por_extenso(estado["atualizado_em"]),
+    publicadas = {t["tabela"]: t["linhas"] for t in (estado.get("tabelas") or [])}
+    total_origem = linhas_origem.get(edicao["dataset"])
+
+    linhas = [
+        f"<b>▊ {html.escape(edicao['titulo'])}</b>",
         "",
-        f"📥 <b>Origem</b> — MinIO, zona <code>{ZONA_ENTRADA}</code>",
-    ]
-    for dataset, fonte in zip(DATASETS, FONTES_BRUTAS):
-        total = linhas_origem.get(fonte)
-        partes.append(
-            f"• <code>{html.escape(dataset)}</code>"
-            + (f" — {total} linhas" if total is not None else "")
-        )
-        partes.append(f"  no Dremio: <code>{html.escape(fonte)}</code>")
-    partes += [
+        f"<u>Origem</u> · MinIO, zona <code>{ZONA_ENTRADA}</code>",
+        f"    arquivo · <code>{html.escape(edicao['arquivo'])}</code>"
+        + (f" — {total_origem} linhas" if total_origem is not None else ""),
+        f"    dataset · <code>{html.escape(edicao['dataset'])}</code>",
         "",
-        f"📦 <b>Tabelas reescritas</b> — Iceberg na zona <code>{ZONA_ARMAZEM}</code> do MinIO, "
-        "catálogo Nessie:",
+        "<u>Refinamento</u> · Spark",
+        f"    notebook · <code>{html.escape(edicao['notebook'])}</code>",
+        "",
+        f"<u>Tabelas</u> · Iceberg, zona <code>{ZONA_ARMAZEM}</code>, catálogo Nessie",
     ]
-    for tabela in estado.get("tabelas") or []:
-        antes = anteriores.get(tabela["tabela"])
-        delta = ""
-        if antes is not None and antes != tabela["linhas"]:
-            delta = f" ({tabela['linhas'] - antes:+d})"
-        partes.append(f"• <code>{html.escape(tabela['tabela'])}</code> — {tabela['linhas']} linhas{delta}")
-    if not estado.get("tabelas"):
-        partes.append("(nenhuma tabela publicada)")
-    partes.append(
-        "\n<i>Toda carga reescreve as tabelas por inteiro; o número entre parênteses é a "
-        "variação de linhas desde a carga anterior.</i>"
-    )
+    # Percorre as tabelas DESTA edicao na ordem declarada, nao a ordem alfabetica
+    # do manifesto: assim a principal (`_fases`) nao cai no meio da lista.
+    for tabela in edicao["views"].values():
+        completo = f"nessie.refinamento.{tabela}"
+        if completo not in publicadas:
+            linhas.append(f"    ✗ <code>{html.escape(tabela)}</code> — não publicada nesta carga")
+            continue
+        n = publicadas[completo]
+        linhas.append(f"    • <code>{html.escape(tabela)}</code> — {n} linhas"
+                      + _variacao(n, anteriores.get(completo)))
+
+    caminho = " › ".join(PASTA_VIEWS[1:] + [edicao["pasta"]])
+    linhas += [
+        "",
+        f"<u>Views</u> · space <code>{PASTA_VIEWS[0]}</code>",
+        f"    {html.escape(caminho)}",
+    ]
+    for view in edicao["views"]:
+        marca = "  ← lida pelo painel" if view == edicao.get("principal") else ""
+        linhas.append(f"    • <code>{html.escape(view)}</code>{marca}")
+    return linhas
+
+
+def _mensagem(estado: dict, anteriores: dict[str, int]) -> str:
+    """Aviso do Telegram, uma seção por edição.
+
+    "Onde o dado mora" importa porque a mesma informação aparece com quatro
+    nomes diferentes ao longo do caminho: o arquivo no MinIO, o dataset que o
+    Dremio promoveu, a tabela Iceberg no Nessie e a view no space. A seção de
+    cada edição mostra os quatro na ordem em que o dado passa por eles.
+    """
+    etapas = estado.get("etapas") or {}
+    origem = estado.get("origem", "")
+    cabecalho = [
+        "🟢 <b>Painel SEMARH — dados atualizados</b>",
+        f"<i>{_por_extenso(estado['atualizado_em'])} · carga {origem} · "
+        f"{_duracao(estado.get('duracao_s'))}</i>",
+    ]
+    # Uma etapa que falhou nao derruba a carga (o dado ja esta publicado), mas
+    # nao pode passar despercebida no meio da mensagem: vai logo no topo.
+    problemas = [nome for nome, situacao in etapas.items() if situacao != "ok"]
+    if problemas:
+        cabecalho.append(f"⚠️ <b>Com ressalvas:</b> {', '.join(problemas)} — veja os logs.")
+
+    corpo = []
+    for edicao in EDICOES:
+        corpo += ["", "━━━━━━━━━━━━━━━━━━", ""] + _bloco_edicao(edicao, estado, anteriores)
+
+    # Tabelas publicadas por notebooks fora das edicoes acima — nao somem da
+    # notificacao so por nao terem uma secao propria.
+    outras = [t for t in (estado.get("tabelas") or [])
+              if t["tabela"] not in EDICAO_DA_TABELA]
+    if outras:
+        corpo += ["", "━━━━━━━━━━━━━━━━━━", "", "<b>▊ Outras tabelas publicadas</b>", ""]
+        corpo += [f"    • <code>{html.escape(t['tabela'])}</code> — {t['linhas']} linhas"
+                  + _variacao(t["linhas"], anteriores.get(t["tabela"])) for t in outras]
+
+    rodape = [
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        "",
+        "<i>Toda carga reescreve as tabelas por inteiro e recria as views; o número em "
+        "negrito é a variação de linhas desde a carga anterior.</i>",
+    ]
     if estado.get("novidades"):
-        partes.append("\n🔎 <b>Novidades no ambiente:</b>")
-        partes += [f"• {html.escape(n)}" for n in estado["novidades"]]
-    return "\n".join(partes)
+        rodape += ["", "🔎 <b>Novidades no ambiente</b>",
+                   "<i>mudanças desde a carga anterior, inclusive feitas por fora do pipeline</i>"]
+        for grupo in estado["novidades"]:
+            rodape += ["", f"<u>{html.escape(grupo['titulo'])}</u>"]
+            if grupo.get("prefixo"):
+                # O prefixo comum vira cabecalho do grupo; os itens abaixo sao
+                # so o que os distingue.
+                rodape.append(f"    em <code>{html.escape(grupo['prefixo'])}</code>")
+            rodape += [f"    • <code>{html.escape(item)}</code>" for item in grupo["itens"]]
+            if grupo.get("restantes"):
+                rodape.append(f"    <i>… e mais {grupo['restantes']}</i>")
+    return "\n".join(cabecalho + corpo + rodape)
 
 
 @app.task(name="painel.atualizar", bind=True)
@@ -473,7 +555,7 @@ def atualizar(self, forcar: bool = False) -> dict:
         "atualizado_em": datetime.now(FUSO).isoformat(timespec="seconds"),
         "iniciado_em": agora.isoformat(timespec="seconds"),
         "duracao_s": round(time.monotonic() - inicio, 1),
-        "datasets": DATASETS,
+        "edicoes": [{"titulo": e["titulo"], "arquivo": e["arquivo"]} for e in EDICOES],
         "tabelas": tabelas,
         "linhas": linhas,
         "linhas_origem": linhas_origem,
