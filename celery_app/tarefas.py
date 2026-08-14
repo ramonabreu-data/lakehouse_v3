@@ -58,7 +58,7 @@ def _lista(bruto: str) -> list[str]:
     return [item.strip() for item in bruto.split(",") if item.strip()]
 
 
-                                                                                                                                                                                                                                                                                                                                                                                ARQUIVO_ESTADO = Path(os.getenv("ARQUIVO_ESTADO", "/estado/atualizacao.json"))
+ARQUIVO_ESTADO = Path(os.getenv("ARQUIVO_ESTADO", "/estado/atualizacao.json"))
 # Observabilidade: uma linha JSON por execucao, append-only. E a fonte do
 # historico que aparece no painel e do "o que mudou" da notificacao.
 ARQUIVO_HISTORICO = Path(os.getenv("ARQUIVO_HISTORICO", "/estado/historico.jsonl"))

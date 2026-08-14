@@ -92,20 +92,13 @@ flowchart LR
 
 ### O caminho do dado
 
-```
-  origem            entrada          refinamento         publicação          consumo
- ┌────────┐      ┌───────────┐     ┌────────────┐     ┌───────────┐     ┌────────────┐
- │ banco  │      │  MinIO    │     │   Spark    │     │  Dremio   │     │ Streamlit  │
- │ CSV    │ ───► │ zona      │ ──► │ limpa e    │ ──► │ expõe SQL │ ──► │ gráficos e │
- │ API    │      │ entrada   │     │ agrega     │     │ federado  │     │ mapa       │
- └────────┘      └───────────┘     └─────┬──────┘     └─────▲─────┘     └────────────┘
-                                         │ Iceberg          │ lê catálogo
-                                         ▼                  │
-                                  ┌─────────────┐     ┌───────────┐
-                                  │ MinIO       │◄────│  Nessie   │
-                                  │ zona armazém│     │ catálogo  │
-                                  └─────────────┘     └───────────┘
-```
+![Arquitetura da plataforma](docs/arquitetura.svg)
+
+<sub>Diagrama gerado por [`docs/gerar_arquitetura.py`](docs/gerar_arquitetura.py) — os logos ficam
+embutidos no SVG, então o arquivo abre igual no GitHub, no VS Code e offline. Para regerar depois de
+mudar uma etapa: `python3 docs/gerar_arquitetura.py`. Os originais estão em
+[`docs/logos/`](docs/logos/); as marcas pertencem aos respectivos projetos e aparecem aqui apenas
+para identificar as ferramentas usadas.</sub>
 
 1. **O arquivo chega na zona `entrada`** do MinIO — subido à mão, por script ou por um notebook de
    coleta. Aqui o dado fica **exatamente como veio da origem**, sem tratamento.
