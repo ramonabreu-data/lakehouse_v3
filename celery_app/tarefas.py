@@ -3,12 +3,16 @@
 Todo dia as `HORA_ATUALIZACAO` (07:00 por padrao), no fuso **America/Fortaleza**,
 a tarefa `painel.atualizar` refaz o caminho inteiro do dado:
 
-1. **Dataset**  — manda o Dremio reler os metadados do parquet da zona de
+1. **Datasets** — manda o Dremio reler os metadados dos parquets da zona de
    entrada, para enxergar um arquivo novo publicado no MinIO.
-2. **DataFrame + analise** — reexecuta o notebook de refinamento no Spark, que
-   regrava `refinamento.semarh_painel`, `..._fases` e os dois resumos. E o mesmo
-   notebook que uma pessoa roda no JupyterLab: nao ha logica duplicada aqui.
-3. **Dashboard** — grava o carimbo da atualizacao num arquivo compartilhado com
+2. **DataFrame + analise** — reexecuta os notebooks de refinamento no Spark (um
+   por edicao do Selo Ambiental), que regravam as tabelas de `refinamento` e os
+   resumos. Sao os mesmos notebooks que uma pessoa roda no JupyterLab: nao ha
+   logica duplicada aqui.
+3. **Views** — recria as views curadas do space `refinamento`, que sao o caminho
+   pelo qual o painel enxerga o dado. Sao elas o contrato: o nome fisico da
+   tabela no Nessie pode mudar sem que o Streamlit saiba.
+4. **Dashboard** — grava o carimbo da atualizacao num arquivo compartilhado com
    o Streamlit. O painel usa esse carimbo como chave de cache, entao o dado novo
    aparece na proxima interacao, sem esperar o TTL de 5 min vencer.
 
@@ -47,23 +51,79 @@ HORA_ATUALIZACAO = os.getenv("HORA_ATUALIZACAO", "07:00")
 _hora, _minuto = (int(p) for p in HORA_ATUALIZACAO.split(":"))
 
 DIR_NOTEBOOKS = Path(os.getenv("DIR_NOTEBOOKS", "/workspace/notebooks"))
-NOTEBOOK = os.getenv("NOTEBOOK_REFINAMENTO", "semarh_painel/refinamento_selo_ambiental.ipynb")
+
+
+def _lista(bruto: str) -> list[str]:
+    """"a, b , c" -> ["a", "b", "c"] — as variaveis de lista vem por virgula."""
+    return [item.strip() for item in bruto.split(",") if item.strip()]
+
+
+# Um notebook por edicao do Selo Ambiental. Cada um regrava as suas tabelas; a
+# carga so termina bem se TODOS passarem, entao uma edicao com dado inconsistente
+# nao deixa o painel meio atualizado.
+NOTEBOOKS = _lista(os.getenv(
+    "NOTEBOOK_REFINAMENTO",
+    "semarh_painel/refinamento_selo_ambiental.ipynb,"
+    "semarh_painel/refinamento_selo_ambiental_2025.ipynb",
+))
 ARQUIVO_ESTADO = Path(os.getenv("ARQUIVO_ESTADO", "/estado/atualizacao.json"))
 # Observabilidade: uma linha JSON por execucao, append-only. E a fonte do
 # historico que aparece no painel e do "o que mudou" da notificacao.
 ARQUIVO_HISTORICO = Path(os.getenv("ARQUIVO_HISTORICO", "/estado/historico.jsonl"))
-# Nome amigavel do dataset de origem, so para a mensagem.
-DATASET = os.getenv("DATASET_ORIGEM", "sermarh_painel/selo_ambiental_2026.parquet")
+# Nomes amigaveis dos datasets de origem, so para a mensagem.
+DATASETS = _lista(os.getenv(
+    "DATASET_ORIGEM",
+    "sermarh_painel/selo_ambiental_2026.parquet,sermarh_painel/selo_ambiental_2025.parquet",
+))
 # Zonas do object store, so para dizer ONDE cada coisa mora na mensagem.
 ZONA_ENTRADA = os.getenv("ZONA_ENTRADA", "entrada")
 ZONA_ARMAZEM = os.getenv("ZONA_ARMAZEM", "armazem")
 VARS_ENV = Path(os.getenv("VARS_ENV", "/opt/painel/vars.env"))
-# Fonte bruta no Dremio (o parquet da zona de entrada, promovido como dataset).
-FONTE_BRUTA = os.getenv(
+# Fontes brutas no Dremio (os parquets da zona de entrada, promovidos como
+# dataset). Na mesma ordem de DATASETS.
+FONTES_BRUTAS = _lista(os.getenv(
     "FONTE_BRUTA_DREMIO",
-    'minio.entrada."sermarh_painel"."selo_ambiental_2026.parquet"',
+    'minio.entrada."sermarh_painel"."selo_ambiental_2026.parquet",'
+    'minio.entrada."sermarh_painel"."selo_ambiental_2025.parquet"',
+))
+# --------------------------------------------------------------------------
+# Views curadas no space `refinamento` — a interface que o painel consulta
+# --------------------------------------------------------------------------
+# O Streamlit NAO le a tabela Iceberg direto: le estas views. Assim o nome
+# fisico no Nessie (achatado, `semarh_painel_2025_fases`) pode mudar sem tocar
+# no codigo do painel — a view e o contrato, a tabela e o detalhe.
+#
+# Por isso a carga as recria toda vez: uma view apagada por engano volta na
+# proxima execucao, e a estrutura de pastas deixa de depender de alguem ter
+# criado na mao. `CREATE OR REPLACE` sobre uma view que ja aponta para a mesma
+# tabela nao muda nada, entao repetir e barato e seguro.
+#
+# As pastas espelham a navegacao do painel: setor -> familia de BI -> edicao.
+# Quem carrega o ano e a PASTA, entao os nomes das views se repetem nas duas.
+PASTA_VIEWS = _lista(os.getenv(
+    "PASTA_VIEWS_DREMIO",
+    "refinamento,semarh_painel,chefia_gabinete,selos_ambientais",
+))
+VIEWS = {
+    "selos_ambientais_2026": {
+        "selo_ambiental": "semarh_painel",
+        "selo_ambiental_fases": "semarh_painel_fases",
+        "por_tipo_de_selo": "semarh_painel_por_selo",
+        "por_criterios_atendidos": "semarh_painel_por_criterios",
+    },
+    "selos_ambientais_2025": {
+        "selo_ambiental": "semarh_painel_2025",
+        "selo_ambiental_fases": "semarh_painel_2025_fases",
+        "por_tipo_de_selo": "semarh_painel_2025_por_selo",
+        "por_criterios_atendidos": "semarh_painel_2025_por_criterios",
+    },
+}
+# A conferencia final consulta pelo MESMO caminho que o painel usa — se a view
+# quebrar, a carga acusa em vez de deixar o painel cair sozinho depois.
+TABELA_CONFERE = os.getenv(
+    "TABELA_CONFERE",
+    ".".join(PASTA_VIEWS + ["selos_ambientais_2026", "selo_ambiental_fases"]),
 )
-TABELA_CONFERE = os.getenv("TABELA_CONFERE", "nessie.refinamento.semarh_painel_fases")
 
 DIAS = ("segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo")
 
@@ -102,22 +162,86 @@ app.conf.update(
 )
 
 
-def _conexao_dremio():
-    """Conexao Arrow Flight com a conta de servico do painel (vars.env)."""
+def _autenticar_dremio() -> tuple[str, str]:
+    """(URL base HTTP, token) da conta de servico do painel (vars.env)."""
     from dotenv import load_dotenv
-    from dremio_simple_query.connect import DremioConnection, get_token
+    from dremio_simple_query.connect import get_token
 
     if VARS_ENV.exists():
         load_dotenv(VARS_ENV)
-    endpoint = os.getenv("DREMIO_ENDPOINT", "dremio:9047")
+    base = "http://" + os.getenv("DREMIO_ENDPOINT", "dremio:9047")
     token = get_token(
-        uri=f"http://{endpoint}/apiv2/login",
+        uri=f"{base}/apiv2/login",
         payload={
             "userName": os.getenv("DREMIO_USERNAME"),
             "password": os.getenv("DREMIO_PASSWORD"),
         },
     )
+    return base, token
+
+
+def _conexao_dremio():
+    """Conexao Arrow Flight — e por ela que passam consultas e DDL de view."""
+    from dremio_simple_query.connect import DremioConnection
+
+    _, token = _autenticar_dremio()
     return DremioConnection(token, f"grpc://{os.getenv('DREMIO_FLIGHT_ENDPOINT', 'dremio:32010')}")
+
+
+def _garantir_views(conexao) -> None:
+    """Recria as pastas e as views curadas que o painel consulta.
+
+    Pasta em *space* nao se cria por SQL (`CREATE FOLDER` so vale para fonte
+    versionada) e `CREATE VIEW` nao cria os niveis intermediarios sozinho — daí
+    as pastas irem pela API REST do catalogo e as views por SQL.
+
+    Idempotente de ponta a ponta: pasta que ja existe e pulada, view que ja
+    aponta para a mesma tabela e reescrita igual.
+    """
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    base, token = _autenticar_dremio()
+    cabecalhos = {"Content-Type": "application/json",
+                  "Authorization": "_dremio" + token}
+
+    def existe(caminho: list[str]) -> bool:
+        endereco = f"{base}/api/v3/catalog/by-path/" + urllib.parse.quote("/".join(caminho))
+        try:
+            urllib.request.urlopen(urllib.request.Request(endereco, headers=cabecalhos))
+            return True
+        except urllib.error.HTTPError as erro:
+            if erro.code == 404:
+                return False
+            raise
+
+    def criar_pasta(caminho: list[str]) -> None:
+        if existe(caminho):
+            return
+        pedido = urllib.request.Request(
+            f"{base}/api/v3/catalog",
+            data=json.dumps({"entityType": "folder", "path": caminho}).encode(),
+            method="POST", headers=cabecalhos,
+        )
+        try:
+            urllib.request.urlopen(pedido)
+        except urllib.error.HTTPError as erro:
+            if erro.code != 409:  # 409 = outra execucao criou primeiro
+                raise
+        log.info("pasta criada no Dremio: %s", "/".join(caminho))
+
+    # O primeiro nivel e o proprio space, que ja existe e nao se cria por aqui.
+    for nivel in range(2, len(PASTA_VIEWS) + 1):
+        criar_pasta(PASTA_VIEWS[:nivel])
+    for edicao, views in VIEWS.items():
+        criar_pasta(PASTA_VIEWS + [edicao])
+        for view, tabela in views.items():
+            alvo = ".".join(PASTA_VIEWS + [edicao, view])
+            conexao.toPandas(
+                f"CREATE OR REPLACE VIEW {alvo} AS "
+                f"SELECT * FROM nessie.refinamento.{tabela} AT BRANCH main"
+            )
 
 
 def _gravar_estado(dados: dict) -> None:
@@ -173,14 +297,21 @@ def _mensagem(estado: dict, anteriores: dict[str, int]) -> str:
     diferentes: o arquivo no MinIO, a tabela Iceberg no catálogo Nessie e o
     caminho pelo qual o Dremio a serve.
     """
+    linhas_origem = estado.get("linhas_origem") or {}
     partes = [
         "🟢 <b>Dados atualizados</b>",
         _por_extenso(estado["atualizado_em"]),
         "",
         f"📥 <b>Origem</b> — MinIO, zona <code>{ZONA_ENTRADA}</code>",
-        f"<code>{html.escape(DATASET)}</code>"
-        + (f" — {estado['linhas_origem']} linhas" if estado.get("linhas_origem") else ""),
-        f"no Dremio: <code>{html.escape(FONTE_BRUTA)}</code>",
+    ]
+    for dataset, fonte in zip(DATASETS, FONTES_BRUTAS):
+        total = linhas_origem.get(fonte)
+        partes.append(
+            f"• <code>{html.escape(dataset)}</code>"
+            + (f" — {total} linhas" if total is not None else "")
+        )
+        partes.append(f"  no Dremio: <code>{html.escape(fonte)}</code>")
+    partes += [
         "",
         f"📦 <b>Tabelas reescritas</b> — Iceberg na zona <code>{ZONA_ARMAZEM}</code> do MinIO, "
         "catálogo Nessie:",
@@ -222,39 +353,55 @@ def atualizar(self, forcar: bool = False) -> dict:
 
     progresso(5, "Preparando a atualização")
 
-    # 1. dataset: o Dremio so enxerga um parquet novo depois do refresh.
-    try:
-        _conexao_dremio().toPandas(f"ALTER TABLE {FONTE_BRUTA} REFRESH METADATA FORCE UPDATE")
-        etapas["dremio_refresh"] = "ok"
-    except Exception as erro:  # nao aborta: o refinamento le do MinIO, nao do Dremio
-        etapas["dremio_refresh"] = f"falhou: {erro}"[:300]
-        log.warning("refresh de metadados falhou (segue mesmo assim): %s", erro)
-    progresso(20, "Lendo o dataset da zona de entrada")
+    # 1. datasets: o Dremio so enxerga um parquet novo depois do refresh.
+    falhas_refresh = []
+    for fonte in FONTES_BRUTAS:
+        try:
+            _conexao_dremio().toPandas(f"ALTER TABLE {fonte} REFRESH METADATA FORCE UPDATE")
+        except Exception as erro:  # nao aborta: o refinamento le do MinIO, nao do Dremio
+            falhas_refresh.append(f"{fonte}: {erro}"[:150])
+            log.warning("refresh de metadados falhou em %s (segue mesmo assim): %s", fonte, erro)
+    etapas["dremio_refresh"] = "; ".join(falhas_refresh)[:300] if falhas_refresh else "ok"
+    progresso(20, "Lendo os datasets da zona de entrada")
 
-    # 2. dataframe + analise: o MESMO notebook que roda no JupyterLab.
+    # 2. dataframe + analise: os MESMOS notebooks que rodam no JupyterLab, um
+    # por edicao. Rodam em sequencia porque cada um sobe o seu driver Spark.
     estimativa = float(_ler_estado().get("duracao_s") or 90)
-    # O notebook anota aqui cada tabela que publicar (ver lakehouse.gravar).
+    # Os notebooks anotam aqui cada tabela que publicarem (ver lakehouse.gravar).
     manifesto = ARQUIVO_ESTADO.parent / f".manifesto-{self.request.id}.jsonl"
-    with tempfile.TemporaryDirectory() as tmp:
-        processo = subprocess.Popen(
-            ["jupyter", "nbconvert", "--to", "notebook", "--execute",
-             "--ExecutePreprocessor.timeout=900",
-             "--output", str(Path(tmp) / "execucao.ipynb"), NOTEBOOK],
-            cwd=DIR_NOTEBOOKS, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            env={**os.environ, "MANIFESTO_PUBLICACAO": str(manifesto)},
-        )
-        while processo.poll() is None:
-            fracao = min((time.monotonic() - inicio) / max(estimativa, 1), 1.0)
-            progresso(20 + int(70 * fracao), "Refinando os dados no Spark")
-            time.sleep(2)
-        saida, erro_saida = processo.communicate()
-        processo.stdout_texto, processo.stderr_texto = saida, erro_saida
-    if processo.returncode != 0:
+    falhou = None
+    for indice, notebook in enumerate(NOTEBOOKS):
+        # A barra cobre os 70 pontos divididos entre os notebooks; dentro de cada
+        # fatia ela anda pelo tempo decorrido, com a duracao da carga anterior
+        # como estimativa.
+        base = 20 + int(70 * indice / len(NOTEBOOKS))
+        fatia = 70 / len(NOTEBOOKS)
+        comeco = time.monotonic()
+        with tempfile.TemporaryDirectory() as tmp:
+            processo = subprocess.Popen(
+                ["jupyter", "nbconvert", "--to", "notebook", "--execute",
+                 "--ExecutePreprocessor.timeout=900",
+                 "--output", str(Path(tmp) / "execucao.ipynb"), notebook],
+                cwd=DIR_NOTEBOOKS, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                env={**os.environ, "MANIFESTO_PUBLICACAO": str(manifesto)},
+            )
+            while processo.poll() is None:
+                decorrido = time.monotonic() - comeco
+                fracao = min(decorrido / max(estimativa / len(NOTEBOOKS), 1), 1.0)
+                progresso(base + int(fatia * fracao),
+                          f"Refinando os dados no Spark ({Path(notebook).stem})")
+                time.sleep(2)
+            saida, erro_saida = processo.communicate()
+        if processo.returncode != 0:
+            falhou = (notebook, (erro_saida or saida or "")[-1500:])
+            break
+    if falhou:
         # As validacoes do notebook viram assert: se o dado chegou inconsistente,
         # a tarefa falha e as tabelas antigas continuam no ar (nada e publicado
         # pela metade). O erro fica no log e no carimbo.
-        cauda = (processo.stderr_texto or processo.stdout_texto or "")[-1500:]
-        etapas["refinamento"] = "falhou"
+        notebook, cauda = falhou
+        manifesto.unlink(missing_ok=True)
+        etapas["refinamento"] = f"falhou em {notebook}"
         falha = {
             "atualizado_em": None,
             "falhou_em": datetime.now(FUSO).isoformat(timespec="seconds"),
@@ -274,17 +421,34 @@ def atualizar(self, forcar: bool = False) -> dict:
             f"<pre>{html.escape(cauda[-500:])}</pre>",
             evento="falha",
         )
-        raise RuntimeError(f"notebook de refinamento falhou:\n{cauda}")
+        raise RuntimeError(f"notebook de refinamento {notebook} falhou:\n{cauda}")
     etapas["refinamento"] = "ok"
     tabelas = _ler_manifesto(manifesto)
 
-    # 3. confere e carimba — o carimbo e a chave de cache do dashboard.
+    # 3. views curadas: o caminho pelo qual o painel enxerga o dado. Vem DEPOIS
+    # do refinamento (as tabelas ja existem) e ANTES da conferencia, que passa
+    # por elas de proposito.
+    progresso(90, "Publicando as views no Dremio")
+    try:
+        _garantir_views(_conexao_dremio())
+        etapas["views"] = "ok"
+    except Exception as erro:
+        # Nao aborta: o dado esta publicado nas tabelas. Mas a conferencia logo
+        # abaixo consulta pela view, entao uma falha aqui nao passa despercebida.
+        etapas["views"] = f"falhou: {erro}"[:300]
+        log.warning("não consegui recriar as views curadas: %s", erro)
+
+    # 4. confere e carimba — o carimbo e a chave de cache do dashboard.
     progresso(92, "Conferindo as tabelas publicadas")
-    linhas = linhas_origem = None
+    linhas = None
+    linhas_origem: dict[str, int] = {}
     try:
         conexao = _conexao_dremio()
         linhas = int(conexao.toPandas(f"SELECT COUNT(*) AS n FROM {TABELA_CONFERE}")["n"][0])
-        linhas_origem = int(conexao.toPandas(f"SELECT COUNT(*) AS n FROM {FONTE_BRUTA}")["n"][0])
+        for fonte in FONTES_BRUTAS:
+            linhas_origem[fonte] = int(
+                conexao.toPandas(f"SELECT COUNT(*) AS n FROM {fonte}")["n"][0]
+            )
         etapas["conferencia"] = "ok"
     except Exception as erro:
         etapas["conferencia"] = f"falhou: {erro}"[:300]
@@ -292,7 +456,7 @@ def atualizar(self, forcar: bool = False) -> dict:
     # Linhas de cada tabela na carga anterior — vira a variacao na mensagem.
     anteriores = {t["tabela"]: t["linhas"] for t in (_ler_estado().get("tabelas") or [])}
 
-    # 4. varredura do ambiente: o que mudou no Dremio e no MinIO desde a carga
+    # 5. varredura do ambiente: o que mudou no Dremio e no MinIO desde a carga
     # anterior — inclusive coisa criada por fora do pipeline.
     progresso(96, "Varrendo o catálogo")
     try:
@@ -309,7 +473,7 @@ def atualizar(self, forcar: bool = False) -> dict:
         "atualizado_em": datetime.now(FUSO).isoformat(timespec="seconds"),
         "iniciado_em": agora.isoformat(timespec="seconds"),
         "duracao_s": round(time.monotonic() - inicio, 1),
-        "dataset": DATASET,
+        "datasets": DATASETS,
         "tabelas": tabelas,
         "linhas": linhas,
         "linhas_origem": linhas_origem,

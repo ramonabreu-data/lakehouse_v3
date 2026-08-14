@@ -9,7 +9,7 @@ Em cima dessa base rodam três camadas, todas subindo com um `docker compose up 
 | Camada | O que é |
 |---|---|
 | **Lakehouse** | MinIO + Spark + Nessie + Dremio, com as zonas `entrada` / `armazem` / `historico` |
-| **Painel** | app Streamlit com login, servido por HTTPS pelo proxy — hoje com o BI do Selo Ambiental 2026 |
+| **Painel** | app Streamlit com login, servido por HTTPS pelo proxy — hoje com os BIs do Selo Ambiental 2025 e 2026 |
 | **Automação** | Celery: recarrega o dado todo dia às 7h, varre o ambiente e avisa no Telegram |
 
 Toda a identidade da implantação — nome do projeto, prefixo de containers e volumes, nomes das zonas
@@ -578,14 +578,20 @@ e no que o painel exibe. Os serviços sobem com o `docker compose up -d`; não h
 
 O que a tarefa faz, em [`celery_app/tarefas.py`](celery_app/tarefas.py):
 
-1. **Dataset** — `ALTER TABLE … REFRESH METADATA` no parquet da zona de entrada, para o Dremio
+1. **Datasets** — `ALTER TABLE … REFRESH METADATA` nos parquets da zona de entrada, para o Dremio
    enxergar um arquivo novo publicado no MinIO.
-2. **DataFrame + análise** — reexecuta o **mesmo notebook** de refinamento que uma pessoa roda no
-   JupyterLab (`semarh_painel/refinamento_selo_ambiental.ipynb`), regravando
-   `refinamento.semarh_painel`, `..._fases` e os dois resumos. Não há lógica duplicada entre o
-   notebook e a tarefa — se as validações do notebook falharem, a tarefa falha e **as tabelas
-   antigas continuam no ar**; nada é publicado pela metade.
-3. **Dashboard** — grava o carimbo em `/estado/atualizacao.json` (volume `painel-estado`,
+2. **DataFrame + análise** — reexecuta os **mesmos notebooks** de refinamento que uma pessoa roda no
+   JupyterLab, **um por edição** do Selo Ambiental (`semarh_painel/refinamento_selo_ambiental.ipynb`
+   e `..._2025.ipynb`), regravando as tabelas de `refinamento` e os resumos. Não há lógica duplicada
+   entre os notebooks e a tarefa — se as validações de **qualquer** um falharem, a tarefa falha e
+   **as tabelas antigas continuam no ar**; nada é publicado pela metade. Os notebooks a rodar saem
+   de `NOTEBOOK_REFINAMENTO` (lista separada por vírgula), então uma edição nova entra na carga
+   diária sem mexer no código da tarefa.
+3. **Views** — recria as views curadas do space `refinamento` (pastas pela API REST, views por SQL).
+   São elas que o painel consulta, então recriar a cada carga faz a estrutura se curar sozinha: uma
+   view apagada por engano volta na execução seguinte. A conferência logo abaixo passa por elas de
+   propósito.
+4. **Dashboard** — grava o carimbo em `/estado/atualizacao.json` (volume `painel-estado`,
    compartilhado com o serviço `dashboard`). O Streamlit usa esse carimbo como chave de cache:
    o dado novo aparece assim que o refinamento termina, sem esperar o TTL de 5 min.
 
@@ -618,11 +624,17 @@ Toda carga — automática ou manual — gera três registros:
 quinta, 13/08/2026 às 13:07
 
 📥 Origem — MinIO, zona entrada
-sermarh_painel/selo_ambiental_2026.parquet — 224 linhas
-no Dremio: minio.entrada."sermarh_painel"."selo_ambiental_2026.parquet"
+• sermarh_painel/selo_ambiental_2026.parquet — 224 linhas
+  no Dremio: minio.entrada."sermarh_painel"."selo_ambiental_2026.parquet"
+• sermarh_painel/selo_ambiental_2025.parquet — 224 linhas
+  no Dremio: minio.entrada."sermarh_painel"."selo_ambiental_2025.parquet"
 
 📦 Tabelas reescritas — Iceberg na zona armazem do MinIO, catálogo Nessie:
 • nessie.refinamento.semarh_painel — 224 linhas
+• nessie.refinamento.semarh_painel_2025 — 224 linhas
+• nessie.refinamento.semarh_painel_2025_fases — 672 linhas
+• nessie.refinamento.semarh_painel_2025_por_criterios — 11 linhas
+• nessie.refinamento.semarh_painel_2025_por_selo — 5 linhas
 • nessie.refinamento.semarh_painel_fases — 672 linhas
 • nessie.refinamento.semarh_painel_por_criterios — 11 linhas
 • nessie.refinamento.semarh_painel_por_selo — 5 linhas
@@ -794,13 +806,28 @@ docker compose logs -f dashboard
 
 O app Streamlit tem dois níveis de navegação, ambos espelhados na URL: **áreas** (botões na
 sidebar, `?setor=`) e **BIs** da área (abas, `?bi=`). Para acrescentar um BI, escreva um módulo em
-`app_semarh/bis/` com uma função `render(user)` e registre-o na lista do setor em
+`app_semarh/bis/<setor>/` com uma função `render(user)` e registre-o na lista do setor em
 [`app_semarh/setores.py`](streamlit_test_jupyter/app_semarh/setores.py) — o resto da navegação sai
-de graça.
+de graça. Cada setor com BI implementado tem o seu pacote (hoje só `chefia_de_gabinete`).
 
-### BI Selo Ambiental 2026
+### BI Selo Ambiental — 2025 e 2026
 
-Lê `nessie.refinamento.semarh_painel_fases` (grão: 1 linha por município × fase) e tem quatro
+Duas abas, uma por edição, com a **mesma tela**: o motor fica em
+[`bis/chefia_de_gabinete/selo_ambiental.py`](streamlit_test_jupyter/app_semarh/bis/chefia_de_gabinete/selo_ambiental.py)
+e cada aba (`seloambi_2025.py`, `seloambi_2026.py`) só declara o que é seu — a tabela, o ano e o
+notebook a citar quando a consulta falha. Isso é possível porque os dois refinamentos entregam o
+**mesmo contrato de colunas**. As chaves de widget e de URL são prefixadas pela edição
+(`?selo2025_mun=…`), então o filtro de uma aba não vaza na outra.
+
+O que difere entre as edições vem do próprio dado, sem `if` por ano na tela:
+
+| | 2025 | 2026 |
+|---|---|---|
+| Municípios não postulados | 12 (a situação entra no filtro e no mapa) | 0 |
+| Coluna `Auditor` na tabela | sim — a fonte traz quem analisou cada fase | não existe na fonte |
+| Nome do município na fonte | CAIXA ALTA, normalizado no refinamento | já vem em caixa mista |
+
+Cada aba lê a tabela de fases da sua edição (grão: 1 linha por município × fase) e tem quatro
 visões, na mesma nomenclatura do painel da SEMARH no Looker Studio:
 
 | Visão | O que mostra |
@@ -825,8 +852,8 @@ O que o painel faz além do espelhamento:
 
 ### Duas coisas que o dado ensina
 
-**O selo sai do número de critérios, não da pontuação.** A regra da edição 2026 — conferida nas três
-fases — é `0–2 → não elegível · 3 → Selo C · 4–5 → Selo B · 6+ → Selo A`. As pontuações se
+**O selo sai do número de critérios, não da pontuação.** A regra — conferida nas três fases das duas
+edições, que a usam igual — é `0–2 → não elegível · 3 → Selo C · 4–5 → Selo B · 6+ → Selo A`. As pontuações se
 sobrepõem: há Selo C com mais pontos que Selo A. Por isso a tabela mostra critérios ao lado dos
 pontos, e as barras de critérios saem na cor do selo que aquela faixa produz. O painel **deriva a
 regra do próprio dado** (resultado predominante de cada quantidade de critérios), então ela
@@ -836,9 +863,14 @@ acompanha se a edição mudar.
 é o código sem o prefixo do estado — `2200000 + cod_ibge`. O nome não serve: a dimensão da casa
 grava `Nazária do Piauí` onde a fonte grava `Nazária`.
 
-O refinamento também corrige uma ambiguidade da origem: município **não habilitado fica sem
+O refinamento também corrige uma ambiguidade da origem: município **sem habilitação fica sem
 apuração** (`NULL`), não com `0` critérios. No gráfico de critérios, porém, esses municípios entram
 no balde `0` para bater com o painel de origem — a legenda abaixo do gráfico diz quantos são.
+
+**Nome de município não é chave nem entre edições.** Por isso o refinamento de 2025 normaliza a
+caixa (`SÃO GONÇALO DO PIAUÍ` → `São Gonçalo do Piauí`, com conectivos em minúscula, romanos em
+maiúscula e letra maiúscula depois do apóstrofo): 222 dos 224 nomes passam a bater com os de 2026,
+e os 2 restantes divergem na própria fonte. Comparar as duas edições continua sendo por `cod_ibge`.
 
 ## Notebooks-modelo
 
@@ -870,11 +902,54 @@ entregá-los ao Streamlit. Ela é montada no container, então o que você edita
 
 Detalhes de uso em [`notebooks/README.md`](notebooks/README.md).
 
-Além dos modelos, `notebooks/semarh_painel/refinamento_selo_ambiental.ipynb` é o pipeline **em
-produção** do painel: lê o parquet da zona de entrada, refina as três fases da edição e publica
-`refinamento.semarh_painel`, `..._fases` e os dois resumos. É o mesmo notebook que o serviço de
-[atualização automática](#atualização-automática-celery) reexecuta — não há lógica duplicada entre
-o que a pessoa roda no JupyterLab e o que o robô roda às 7h.
+Além dos modelos, `notebooks/semarh_painel/` é o pipeline **em produção** do painel — um notebook
+por edição do Selo Ambiental (`refinamento_selo_ambiental.ipynb` para 2026,
+`refinamento_selo_ambiental_2025.ipynb` para 2025). Cada um lê o parquet da zona de entrada, refina
+as três fases da sua edição e publica a tabela principal, a de fases e os dois resumos. São os
+mesmos notebooks que o serviço de [atualização automática](#atualização-automática-celery)
+reexecuta — não há lógica duplicada entre o que a pessoa roda no JupyterLab e o que o robô roda às
+7h. Os dois entregam o **mesmo contrato de colunas**, que é o que permite as duas abas do painel
+compartilharem o mesmo código de tela.
+
+| Edição | Notebook | Tabelas publicadas |
+|---|---|---|
+| 2026 | `refinamento_selo_ambiental.ipynb` | `refinamento.semarh_painel`, `..._fases`, `..._por_selo`, `..._por_criterios` |
+| 2025 | `refinamento_selo_ambiental_2025.ipynb` | `refinamento.semarh_painel_2025`, `..._2025_fases`, `..._2025_por_selo`, `..._2025_por_criterios` |
+
+No Dremio, as views são organizadas em pastas que espelham a navegação do painel —
+**setor → família de BI → edição** — e por isso os nomes dos datasets se repetem nas duas edições:
+quem carrega o ano é a pasta, não o nome.
+
+```
+refinamento/
+└── semarh_painel/
+    └── chefia_gabinete/
+        └── selos_ambientais/
+            ├── selos_ambientais_2025/
+            │   ├── selo_ambiental            → nessie.refinamento.semarh_painel_2025
+            │   ├── selo_ambiental_fases      → ..._2025_fases
+            │   ├── por_tipo_de_selo          → ..._2025_por_selo
+            │   └── por_criterios_atendidos   → ..._2025_por_criterios
+            └── selos_ambientais_2026/
+                ├── selo_ambiental            → nessie.refinamento.semarh_painel
+                ├── selo_ambiental_fases      → ..._fases
+                ├── por_tipo_de_selo          → ..._por_selo
+                └── por_criterios_atendidos   → ..._por_criterios
+```
+
+**É por essas views que o painel lê** — não pela tabela Iceberg. A view é o contrato: o nome físico
+no Nessie continua achatado (`semarh_painel_2025_fases`, definido pelo `gravar()` do notebook) e pode
+ser renomeado, ganhar um filtro ou uma coluna calculada sem que o Streamlit saiba.
+
+Para a dependência não virar fragilidade, **a carga recria as views toda vez** (etapa 3 da tarefa,
+logo após o refinamento). Uma view apagada por engano volta na próxima execução, e a estrutura de
+pastas deixa de depender de alguém tê-la criado na mão. A conferência final da tarefa consulta pelo
+**mesmo caminho que o painel usa**, então uma view quebrada acusa na hora da carga em vez de derrubar
+o painel depois.
+
+Pastas em *space* não se criam por SQL (`CREATE FOLDER` só vale para fonte versionada) e
+`CREATE VIEW` não cria os níveis intermediários — por isso as pastas vão pela API REST do catálogo e
+as views por SQL.
 
 ### As três camadas
 
@@ -1154,7 +1229,7 @@ Ambiente de referência: Docker 29.6.1, Compose v5.3.0, kernel Linux 7.0, x86_64
 | Notebooks-modelo executados de ponta a ponta (`nbconvert --execute`) | ✅ |
 | Pipeline completo: PostgreSQL/CSV/JSON → `coleta` → `limpeza` → `refinamento` → Streamlit | ✅ |
 | Painel Selo Ambiental: 3 fases + balanço anual; a 1ª fase reproduz o painel de origem (Looker) indicador por indicador | ✅ |
-| Refinamento do Selo Ambiental: 224 municípios × 3 fases = 672 linhas, código IBGE único, sem apuração em município inabilitado | ✅ |
+| Refinamento do Selo Ambiental (2025 e 2026): 224 municípios × 3 fases = 672 linhas por edição, código IBGE único, sem apuração em município sem habilitação | ✅ |
 | MySQL via JDBC no Spark (contra servidor externo de teste) | ✅ |
 | Imagem própria construída; verificação de import embutida no Dockerfile passa | ✅ |
 | 26 bibliotecas de DS/ML importam; `tensorflow` sem o erro de protobuf da base | ✅ |
@@ -1221,7 +1296,8 @@ dremio-spark-minio/
 ├── notebooks/                        # modelos, montados em /workspace/notebooks
 │   ├── lakehouse.py                  # módulo comum: sessão, leitura, escrita, manifesto
 │   ├── semarh_painel/                # pipeline em produção (não é modelo)
-│   │   └── refinamento_selo_ambiental.ipynb
+│   │   ├── refinamento_selo_ambiental.ipynb       # edição 2026
+│   │   └── refinamento_selo_ambiental_2025.ipynb  # edição 2025
 │   ├── 00_ambiente.ipynb
 │   ├── 01_origem_postgres.ipynb
 │   ├── 02_origem_mysql.ipynb
@@ -1241,7 +1317,12 @@ dremio-spark-minio/
     ├── app_semarh/       # o painel
     │   ├── painel.py           # navegação: áreas na sidebar, BIs em abas
     │   ├── setores.py          # quais áreas existem e os BIs de cada uma
-    │   ├── bis/selo_ambiental.py  # BI Selo Ambiental 2026
+    │   ├── bis/                # um pacote por setor; um módulo por BI
+    │   │   ├── em_construcao.py        # placeholder dos BIs ainda não feitos
+    │   │   └── chefia_de_gabinete/
+    │   │       ├── selo_ambiental.py   # motor de tela, serve as duas edições
+    │   │       ├── seloambi_2025.py    # aba Selo Ambiental 2025
+    │   │       └── seloambi_2026.py    # aba Selo Ambiental 2026
     │   ├── dados.py            # consulta ao Dremio + cache com carimbo
     │   ├── filtros.py          # filtros persistidos na URL
     │   ├── mapa.py             # enquadramento, paletas e legenda do mapa

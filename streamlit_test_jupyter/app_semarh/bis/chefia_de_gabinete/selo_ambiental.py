@@ -1,17 +1,35 @@
-"""BI Selo Ambiental 2026 (SEMARH-PI) — pertence ao setor Chefia de Gabinete.
+"""Motor de tela do BI Selo Ambiental (SEMARH-PI) — serve todas as edições.
 
-Le `nessie.refinamento.semarh_painel_fases` (via Dremio Arrow Flight) e monta,
-por fase: indicadores, distribuicao por tipo de selo e por criterios, mapa dos
-municipios com selo e a tabela de pontuacao/resultado. Tem ainda a visao
-**Balanco anual**, com as 3 fases lado a lado. Nao transforma dado — isso e
-feito no notebook `semarh_painel/refinamento_selo_ambiental`.
+Le a view de fases da edicao (via Dremio Arrow Flight) e monta, por fase:
+indicadores, distribuicao por tipo de selo e por criterios, mapa dos municipios
+com selo e a tabela de pontuacao/resultado. Tem ainda a visao **Balanco anual**,
+com as 3 fases lado a lado. Nao transforma dado — isso e feito nos notebooks
+`semarh_painel/refinamento_selo_ambiental*`.
 
 Layout espelhado no painel de origem da SEMARH (Looker Studio), que publica a
 **1a fase**: mesmos cartoes, mesmos graficos, mesmos funis do balanco e mesma
 ordenacao da tabela. O que o painel acrescenta: seletor de fase (a 3a e o
 resultado final), filtro por municipio, mapa colorido por parametro, clique nos
 graficos para recortar mapa/tabela e a leitura de consistencia dos dados.
+
+As edicoes sao iguais na tela porque o refinamento entrega o MESMO contrato de
+colunas para todas. O que muda de uma para a outra vem em `Edicao`: qual view
+ler, o ano nos titulos e o notebook a citar quando a consulta falha. Colunas que
+so existem em algumas edicoes (`auditor`, por exemplo) sao detectadas no proprio
+DataFrame — nao ha lista para manter em dois lugares.
+
+A leitura passa pelas **views curadas** do space `refinamento`, nao pela tabela
+Iceberg. A view e o contrato: o nome fisico no Nessie pode ser renomeado, a
+tabela pode ganhar um filtro ou uma coluna calculada, e nada disso chega aqui.
+Quem recria essas views a cada carga e a tarefa `painel.atualizar` do Celery.
+
+Cada edicao tem o seu `slug`, e ele prefixa TODA chave de widget e de URL. Sem
+isso as duas abas dividiriam o mesmo estado: o municipio escolhido em 2025 iria
+para o filtro de 2026 e o Streamlit quebraria ao encontrar na sessao um valor
+que nao existe nas opcoes da outra edicao.
 """
+
+from dataclasses import dataclass
 
 import altair as alt
 import pandas as pd
@@ -21,9 +39,26 @@ from app_semarh import mapa
 from app_semarh.dados import consultar, estado_atualizacao
 from app_semarh.filtros import multiselect_opcional_url, multiselect_url, selectbox_url
 
-# Grao: 1 linha por municipio x fase. A tabela `semarh_painel` (so a 3a fase)
-# continua existindo para quem consome o resultado final direto.
-TABELA = "nessie.refinamento.semarh_painel_fases"
+
+@dataclass(frozen=True)
+class Edicao:
+    """O que distingue uma edicao da outra. O resto da tela e identico."""
+
+    ano: int
+    # View curada no space `refinamento` do Dremio — NAO a tabela Iceberg. E a
+    # view que e o contrato: o nome fisico no Nessie pode mudar sem tocar aqui.
+    # Grao: 1 linha por municipio x fase. A view irma sem o sufixo `_fases`
+    # existe para quem consome o resultado final direto.
+    fonte: str
+    # Citado na mensagem de erro: e o que a pessoa precisa rodar para a view
+    # existir (a carga publica a tabela E recria a view).
+    notebook: str
+
+    @property
+    def slug(self) -> str:
+        """Prefixo das chaves de widget e de URL desta edicao."""
+        return f"selo{self.ano}"
+
 
 # Visoes do BI, na mesma nomenclatura do painel da SEMARH: 1a/2a/3a fase e o
 # balanco anual (as tres lado a lado). O padrao e a 3a — o resultado final.
@@ -40,10 +75,13 @@ TITULO_VISAO = {"3": "3ª fase", "2": "2ª fase", "1": "1ª fase", BALANCO: "Bal
 # Selo A/B/C e ordinal (A melhor -> C). Tres tons de verde ficavam parecidos
 # demais num ponto de mapa: a rampa vai de verde a laranja (RdYlGn), que separa
 # por MATIZ e por LUMINOSIDADE — legivel tambem para daltonismo verde-vermelho.
-# Situacoes negativas em cinza, fora da rampa.
+# Situacoes negativas em cinza, fora da rampa: o cinza escurece na mesma ordem
+# em que o municipio ficou mais longe do selo (nao elegivel -> nao habilitado ->
+# nao postulado, este ultimo so existe em algumas edicoes).
 COR_SELO = {"A": "#1a9850", "B": "#91cf60", "C": "#f4901e"}
-ORDEM_RESULTADO = ["Selo A", "Selo B", "Selo C", "Não elegível", "Não habilitado"]
-COR_RESULTADO = ["#1a9850", "#91cf60", "#f4901e", "#9e9e9e", "#4d4d4d"]
+ORDEM_RESULTADO = ["Selo A", "Selo B", "Selo C",
+                   "Não elegível", "Não habilitado", "Não postulado"]
+COR_RESULTADO = ["#1a9850", "#91cf60", "#f4901e", "#9e9e9e", "#6d6d6d", "#3d3d3d"]
 
 # Parametro que colore o mapa -> (coluna, tipo de escala).
 MODOS_MAPA = {
@@ -61,10 +99,10 @@ def _regra(df: pd.DataFrame) -> pd.Series:
     """Regra critérios -> resultado, **derivada do dado**, não fixa no código.
 
     O selo sai do numero de criterios atendidos, nao da pontuacao. Em vez de
-    cravar as faixas aqui (que envelhecem a cada recarga da fonte), toma-se o
-    resultado predominante de cada quantidade de criterios. Assim, se a regra
-    da edicao mudar, o painel acompanha — e o que destoar vira excecao visivel
-    em vez de virar texto errado.
+    cravar as faixas aqui (que envelhecem a cada edicao), toma-se o resultado
+    predominante de cada quantidade de criterios. Assim, se a regra da edicao
+    mudar, o painel acompanha — e o que destoar vira excecao visivel em vez de
+    virar texto errado.
     """
     base = df.dropna(subset=["criterios_atendidos"])
     return base.groupby("criterios_atendidos")["resultado"].agg(lambda s: s.mode().iat[0])
@@ -107,17 +145,18 @@ def _recorte(f: pd.DataFrame, sel_selo: list[str], sel_crit: list[str]) -> pd.Da
     return recorte
 
 
-def _limpar_selecao() -> None:
-    """Zera o clique nos dois graficos.
+def _limpar_selecao(slug: str) -> None:
+    """Zera o clique nos dois graficos DESTA edicao.
 
     O estado de evento de um grafico e read-only no Streamlit — nao da para
     apagar direto. O jeito que funciona e trocar a CHAVE do widget: com chave
     nova, o grafico nasce sem selecao. Este contador entra na chave.
     """
-    st.session_state["_reset_graficos"] = st.session_state.get("_reset_graficos", 0) + 1
+    chave = f"_reset_graficos_{slug}"
+    st.session_state[chave] = st.session_state.get(chave, 0) + 1
 
 
-def _chave_graficos(fase: str, *filtros) -> str:
+def _chave_graficos(slug: str, fase: str, *filtros) -> str:
     """Chave dos graficos: muda quando muda a fase, um filtro ou o botao.
 
     Sem isso o clique de antes sobrevive a troca de fase/filtro — a barra
@@ -125,7 +164,8 @@ def _chave_graficos(fase: str, *filtros) -> str:
     mostrar algo que os graficos acima nao mostram. Era essa a inconsistencia.
     """
     assinatura = abs(hash(tuple(tuple(sorted(x)) for x in filtros)))
-    return f"{fase}_{assinatura}_{st.session_state.get('_reset_graficos', 0)}"
+    reset = st.session_state.get(f"_reset_graficos_{slug}", 0)
+    return f"{slug}_{fase}_{assinatura}_{reset}"
 
 
 TOOLTIP = (
@@ -214,7 +254,7 @@ def _funil(dados: pd.DataFrame, titulo: str) -> None:
     )
 
 
-def _balanco(f: pd.DataFrame) -> None:
+def _balanco(f: pd.DataFrame, edicao: Edicao) -> None:
     """Balanço anual: as 3 fases lado a lado + a tabela larga por município.
 
     Recebe o dado ja filtrado (territorio/municipio) no formato longo, com uma
@@ -271,25 +311,30 @@ def _balanco(f: pd.DataFrame) -> None:
     st.download_button(
         "Baixar CSV",
         largo.to_csv(index=False).encode("utf-8"),
-        file_name="selo_ambiental_2026_balanco_anual.csv",
+        file_name=f"selo_ambiental_{edicao.ano}_balanco_anual.csv",
         mime="text/csv",
+        key=f"csv_balanco_{edicao.slug}",
     )
-    st.caption(f"Fonte: `{TABELA}` — via Dremio Arrow Flight. {_frescor()}")
+    st.caption(f"Fonte: `{edicao.fonte}` — via Dremio Arrow Flight. {_frescor()}")
 
 
-def render(user: dict | None) -> None:
+def render(edicao: Edicao) -> None:
+    """Desenha a aba inteira de uma edicao do Selo Ambiental."""
+    slug = edicao.slug
     try:
-        todas = consultar(f"SELECT * FROM {TABELA}")
+        todas = consultar(f"SELECT * FROM {edicao.fonte}")
     except Exception as erro:
         st.error(f"Falha ao consultar o Dremio: {erro}")
         st.caption(
-            "Confira: a stack está no ar, as credenciais em `vars.env` estão corretas, e a tabela "
-            f"`{TABELA}` existe — rode o notebook `semarh_painel/refinamento_selo_ambiental`."
+            "Confira: a stack está no ar, as credenciais em `vars.env` estão corretas, e a view "
+            f"`{edicao.fonte}` existe. Uma carga completa resolve os dois últimos casos — ela "
+            f"publica a tabela (notebook `{edicao.notebook}`) **e** recria a view; use o botão "
+            "**Atualizar dados agora** na barra lateral."
         )
         return
 
     if todas.empty:
-        st.warning(f"A tabela `{TABELA}` está vazia.")
+        st.warning(f"A view `{edicao.fonte}` está vazia.")
         return
 
     # Qual fase esta na tela e a duvida numero 1 ao comparar com listas
@@ -299,14 +344,14 @@ def render(user: dict | None) -> None:
     todas["criterios_atendidos"] = pd.to_numeric(todas["criterios_atendidos"], errors="coerce")
 
     visao = selectbox_url(
-        "Visão", list(VISOES), "fase", padrao="3", formato=VISOES.get,
-        ajuda="As 3 fases da edição 2026 ou o balanço anual, que mostra as três juntas. "
-              "O resultado válido é o da 3ª fase; as anteriores são parciais.",
+        "Visão", list(VISOES), f"{slug}_fase", padrao="3", formato=VISOES.get,
+        ajuda=f"As 3 fases da edição {edicao.ano} ou o balanço anual, que mostra as três "
+              "juntas. O resultado válido é o da 3ª fase; as anteriores são parciais.",
     )
     # A fase entra no titulo porque muda TODOS os numeros da tela — no seletor
     # sozinho passava despercebido. O contexto de cada fase fica na ajuda do
     # seletor, nao ocupando a tela.
-    st.subheader(f"Selo Ambiental 2026 — Piauí · {TITULO_VISAO[visao]}")
+    st.subheader(f"Selo Ambiental {edicao.ano} — Piauí · {TITULO_VISAO[visao]}")
 
     df = (todas if visao == BALANCO else todas[todas["fase"] == int(visao)]).copy()
 
@@ -325,13 +370,14 @@ def render(user: dict | None) -> None:
     else:
         c_terr, c_sit, c_mun = st.columns(3)
         situacoes = sorted(df["situacao"].dropna().unique())
-        sel_sit = multiselect_url("Situação", situacoes, "sit", c_sit)
-    sel_terr = multiselect_url("Território de desenvolvimento", territorios, "terr", c_terr)
+        sel_sit = multiselect_url("Situação", situacoes, f"{slug}_sit", c_sit)
+    sel_terr = multiselect_url("Território de desenvolvimento", territorios,
+                               f"{slug}_terr", c_terr)
     # Municipio: vazio = todos. Serve tanto para comparar um punhado de
     # municipios quanto para isolar um so — vale para KPIs, graficos, mapa e
     # tabela, entao o painel inteiro passa a falar so da selecao.
     sel_mun = multiselect_opcional_url(
-        "Município", municipios, "mun", c_mun,
+        "Município", municipios, f"{slug}_mun", c_mun,
         ajuda="Deixe vazio para ver todos. Escolha um ou vários para comparar.",
         placeholder="Todos os municípios",
     )
@@ -351,7 +397,7 @@ def render(user: dict | None) -> None:
         st.caption(f"Filtrando {n_mun} de {df['municipio'].nunique()} municípios.")
 
     if visao == BALANCO:
-        _balanco(f)
+        _balanco(f, edicao)
         return
     f = f.drop(columns=["fase"])
 
@@ -377,7 +423,7 @@ def render(user: dict | None) -> None:
     # Faixa de criterios como texto: e por ela que a barra e selecionada, entao
     # precisa existir tambem em `f` para o clique poder filtrar as linhas.
     f["_faixa"] = ["0" if pd.isna(v) else str(int(v)) for v in f["criterios_atendidos"]]
-    chave = _chave_graficos(visao, sel_terr, sel_sit, sel_mun)
+    chave = _chave_graficos(slug, visao, sel_terr, sel_sit, sel_mun)
 
     esq, dir = st.columns(2)
     with esq:
@@ -414,10 +460,10 @@ def render(user: dict | None) -> None:
         )
     with dir:
         st.markdown("**Número de municípios por critérios atendidos**")
-        # Criterio do painel de origem: municipio nao habilitado (sem apuracao
-        # na fonte) entra no balde "0". Mantido para o grafico bater com o
-        # Looker; a composicao do balde vai na legenda abaixo, porque "nao foi
-        # avaliado" e "atendeu zero criterios" nao sao a mesma coisa.
+        # Criterio do painel de origem: municipio sem apuracao na fonte entra no
+        # balde "0". Mantido para o grafico bater com o Looker; a composicao do
+        # balde vai na legenda abaixo, porque "nao foi avaliado" e "atendeu zero
+        # criterios" nao sao a mesma coisa.
         por_crit = f.groupby("_faixa").size().reset_index(name="municipios")
         ordem_crit = sorted(por_crit["_faixa"], key=int)
         clique_crit = alt.selection_point(name="criterios", fields=["_faixa"])
@@ -448,8 +494,8 @@ def render(user: dict | None) -> None:
         sem_apuracao = int(f["criterios_atendidos"].isna().sum())
         if sem_apuracao:
             st.caption(
-                f"A barra **0** inclui {sem_apuracao} município(s) não habilitado(s), sem "
-                "apuração na fonte — mesmo critério do painel de origem."
+                f"A barra **0** inclui {sem_apuracao} município(s) sem apuração na fonte "
+                "(não habilitados ou não postulados) — mesmo critério do painel de origem."
             )
 
     st.divider()
@@ -473,7 +519,8 @@ def render(user: dict | None) -> None:
             f"🔎 **Mapa e tabela filtrados por:** {' + '.join(partes)} — "
             f"{len(foco)} de {len(f)} municípios."
         )
-        c_btn.button("Limpar seleção", on_click=_limpar_selecao, width='stretch')
+        c_btn.button("Limpar seleção", on_click=_limpar_selecao, args=(slug,),
+                     key=f"limpar_{slug}", width='stretch')
         if foco.empty:
             st.warning("Nenhum município nessa combinação de barras.")
             return
@@ -489,10 +536,10 @@ def render(user: dict | None) -> None:
         st.caption("Nenhum município com coordenadas nos filtros atuais.")
     else:
         c_modo, c_esc = st.columns([2, 1])
-        modo = c_modo.selectbox("Colorir por", list(MODOS_MAPA), key="mapa_cor")
+        modo = c_modo.selectbox("Colorir por", list(MODOS_MAPA), key=f"mapa_cor_{slug}")
         # Padrao igual ao painel de origem: so quem tem selo. Desligue para ver
         # tambem os nao elegiveis/nao habilitados.
-        so_com_selo = c_esc.toggle("Só municípios com selo", value=True, key="mapa_selo")
+        so_com_selo = c_esc.toggle("Só municípios com selo", value=True, key=f"mapa_selo_{slug}")
         if so_com_selo:
             geo = geo[geo["tem_selo"]]
         if geo.empty:
@@ -506,9 +553,15 @@ def render(user: dict | None) -> None:
     st.markdown("**Pontuação e resultado dos municípios**")
     # Ordem do painel de origem: pontuacao decrescente. Municipio/Resultado/
     # Pontos sao as colunas de la; criterios, territorio e pacto vem depois.
+    colunas = ["municipio", "resultado", "pontos", "criterios_atendidos",
+               "territorio_desenvolvimento", "pacto_ambiental"]
+    # `auditor` so existe nas edicoes cuja fonte traz o nome de quem analisou
+    # (2025 traz; 2026 nao). Detectado no proprio dado para nao virar uma lista
+    # de excecoes por edicao para manter.
+    if "auditor" in foco.columns and foco["auditor"].notna().any():
+        colunas.append("auditor")
     tabela = (
-        foco[["municipio", "resultado", "pontos", "criterios_atendidos",
-           "territorio_desenvolvimento", "pacto_ambiental"]]
+        foco[colunas]
         .sort_values("pontos", ascending=False, na_position="last")
         .reset_index(drop=True)
     )
@@ -523,12 +576,14 @@ def render(user: dict | None) -> None:
             "criterios_atendidos": st.column_config.NumberColumn("Critérios", format="%d"),
             "territorio_desenvolvimento": "Território",
             "pacto_ambiental": st.column_config.CheckboxColumn("Pacto ambiental"),
+            "auditor": "Auditor",
         },
     )
     st.download_button(
         "Baixar CSV",
         tabela.to_csv(index=False).encode("utf-8"),
-        file_name="selo_ambiental_2026.csv",
+        file_name=f"selo_ambiental_{edicao.ano}.csv",
         mime="text/csv",
+        key=f"csv_tabela_{slug}",
     )
-    st.caption(f"Fonte: `{TABELA}` — via Dremio Arrow Flight. {_frescor()}")
+    st.caption(f"Fonte: `{edicao.fonte}` — via Dremio Arrow Flight. {_frescor()}")

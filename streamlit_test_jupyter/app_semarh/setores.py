@@ -1,10 +1,12 @@
 """Modelo de navegacao: setores (botoes na sidebar) e os BIs (abas) de cada um.
 
-Para implementar um BI: escreva o modulo em `app_semarh/bis/` com uma funcao
-`render(user)` e troque o placeholder pela funcao real na lista `bis` do setor.
+Para implementar um BI: escreva o modulo em `app_semarh/bis/<setor>/` com uma
+funcao `render(user)` e troque o placeholder pela funcao real na lista `bis` do
+setor. Cada setor com BI implementado ganha o seu pacote (hoje so
+`chefia_de_gabinete`), para o codigo de um setor nao se misturar com o do outro.
 """
 
-from app_semarh.bis import selo_ambiental
+from app_semarh.bis.chefia_de_gabinete import seloambi_2025, seloambi_2026
 from app_semarh.bis.em_construcao import render_para
 
 SETORES = [
@@ -14,8 +16,8 @@ SETORES = [
         "slug": "chefia",
         "titulo": "Chefia de Gabinete",
         "bis": [
-            {"slug": "selo_2026", "titulo": "Selo Ambiental 2026", "render": selo_ambiental.render},
-            {"slug": "selo_2025", "titulo": "Selo Ambiental 2025", "render": render_para("Selo Ambiental 2025")},
+            {"slug": "selo_2026", "titulo": "Selo Ambiental 2026", "render": seloambi_2026.render},
+            {"slug": "selo_2025", "titulo": "Selo Ambiental 2025", "render": seloambi_2025.render},
             {"slug": "acoes_secretario", "titulo": "Ações Secretário", "render": render_para("Ações Secretário")},
             {"slug": "compromissos_governo", "titulo": "Compromissos de Governo", "render": render_para("Compromissos de Governo")},
             {"slug": "relatorio_agenda", "titulo": "Relatório Agenda Adm Gov", "render": render_para("Relatório Agenda Adm Gov")},
