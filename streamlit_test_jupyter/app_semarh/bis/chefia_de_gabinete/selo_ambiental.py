@@ -175,12 +175,25 @@ TOOLTIP = (
 )
 
 
-def _desenhar_mapa(geo: pd.DataFrame, modo: str) -> None:
+def _pertencimento(todas: pd.DataFrame) -> dict[int, str]:
+    """{cod_ibge: território} de TODOS os municípios, não só os filtrados.
+
+    O sombreado dos territorios e contexto geografico: some fosse recortado
+    junto com os pontos, o estado apareceria pela metade sempre que um filtro
+    estivesse ativo.
+    """
+    base = todas.dropna(subset=["cod_ibge", "territorio_desenvolvimento"])
+    return {int(c): t for c, t in zip(base["cod_ibge"],
+                                      base["territorio_desenvolvimento"])}
+
+
+def _desenhar_mapa(geo: pd.DataFrame, modo: str, pertencimento: dict[int, str]) -> None:
     """Colore os municipios pelo parametro escolhido e desenha mapa + legenda.
 
     O tamanho do circulo acompanha a pontuacao (area proporcional), como no
     painel de origem: a cor conta o parametro escolhido, o tamanho conta quanto
-    o municipio pontuou.
+    o municipio pontuou. Por baixo dos pontos vao o sombreado de fora do estado
+    e os territorios (ver `mapa.contexto`).
     """
     coluna, tipo = MODOS_MAPA[modo]
     geo["_raio"] = mapa.raio_por_valor(geo["pontos"])
@@ -188,7 +201,8 @@ def _desenhar_mapa(geo: pd.DataFrame, modo: str) -> None:
     if tipo == "numero":
         cores, vmin, vmax = mapa.sequencial(geo[coluna])
         geo["_rgb"] = cores
-        mapa.pontos(geo, "_rgb", TOOLTIP, raio_m="_raio")
+        mapa.pontos(geo, "_rgb", TOOLTIP, raio_m="_raio",
+                    base=mapa.contexto(pertencimento))
         mapa.legenda_gradiente(vmin, vmax, modo, casas=0 if coluna == "criterios_atendidos" else 1)
         return
 
@@ -205,7 +219,12 @@ def _desenhar_mapa(geo: pd.DataFrame, modo: str) -> None:
         cores = mapa.paleta(sorted(rotulos.unique()))
 
     geo["_rgb"] = [mapa.hex_rgb(cores.get(v, "#9e9e9e")) for v in rotulos]
-    mapa.pontos(geo, "_rgb", TOOLTIP, raio_m="_raio")
+    # So quando o mapa JA colore por territorio as areas recebem a cor da
+    # legenda; nos outros modos elas ficam neutras para nao disputar significado
+    # com a cor dos pontos.
+    cores_area = cores if coluna == "territorio_desenvolvimento" else None
+    mapa.pontos(geo, "_rgb", TOOLTIP, raio_m="_raio",
+                base=mapa.contexto(pertencimento, cores_area))
     mapa.legenda_categorias(cores, modo)
 
 
@@ -545,7 +564,7 @@ def render(edicao: Edicao) -> None:
         if geo.empty:
             st.caption("Nenhum município com selo nos filtros atuais.")
         else:
-            _desenhar_mapa(geo, modo)
+            _desenhar_mapa(geo, modo, _pertencimento(todas))
 
     st.divider()
 

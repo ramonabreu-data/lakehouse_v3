@@ -900,8 +900,38 @@ O que o painel faz além do espelhamento:
   gráficos combinam em E. Trocar de fase ou de filtro limpa a seleção.
 - **Mapa** com o Piauí inteiro sempre enquadrado (o zoom não pula ao filtrar), círculo proporcional
   à pontuação e cor por parâmetro escolhido: resultado, território, critérios, pontuação ou pacto
-  ambiental.
+  ambiental. Por baixo dos pontos, o estado aparece **em destaque**: tudo o que fica fora do Piauí
+  recebe uma sombra escura, e os **12 territórios de desenvolvimento** são sombreados com as divisas
+  visíveis — ver [Contexto geográfico do mapa](#contexto-geográfico-do-mapa).
 - **Rodapé** com a data da última carga e, na sidebar, o botão de atualizar na hora.
+
+### Contexto geográfico do mapa
+
+Só a nuvem de pontos não diz onde o Piauí começa e termina, nem em que território cada município
+está. O mapa desenha duas camadas antes dos pontos:
+
+| Camada | O que faz | Como é feita |
+|---|---|---|
+| **Sombra fora do estado** | escurece o entorno, deixando o Piauí em evidência | um polígono que cobre a região com **o contorno do estado como furo** — o preenchimento cai só do lado de fora, sem recortar o mapa-base |
+| **Territórios** | mostra as 12 áreas com as divisas visíveis | os 224 municípios do IBGE **unidos por território** (`shapely`), senão apareceriam as divisas municipais e o mapa viraria uma malha de 224 células |
+
+**Os territórios ficam num tom neutro escuro por padrão, não coloridos.** A cor da tela pertence aos
+pontos, que são o dado: um território verde por baixo de um ponto verde de Selo A faria o leitor
+confundir os dois significados. A exceção é quando o próprio mapa já está colorindo **por
+território** — aí as áreas recebem a cor da legenda e polígono e ponto passam a dizer a mesma coisa.
+
+As malhas vêm do IBGE e ficam **versionadas** em
+[`app_semarh/geo/`](streamlit_test_jupyter/app_semarh/geo/): o mapa redesenha a cada rerun do
+Streamlit, e depender de uma API externa nisso deixaria o painel refém da rede. Para atualizar
+(criação ou fusão de município, que é raro):
+
+```bash
+python3 app_semarh/geo/baixar_malhas.py
+```
+
+O vínculo município → território **não** é gravado em arquivo: sai do próprio dado a cada
+carregamento, cruzando por `cod_ibge`. Assim, se o refinamento mudar a lotação de um município, o
+desenho acompanha sem nada para envelhecer no repositório. A união custa ~25 ms e fica em cache.
 
 ### Duas coisas que o dado ensina
 

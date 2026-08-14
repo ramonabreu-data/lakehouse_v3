@@ -1,6 +1,13 @@
-"""Mapa de pontos do painel (pydeck) — enquadramento, paletas e legenda.
+"""Mapa de pontos do painel (pydeck) — enquadramento, paletas, contexto e legenda.
 
-Compartilhado pelas abas que plotam municipios. Tres decisoes vivem aqui:
+Compartilhado pelas abas que plotam municipios. Quatro decisoes vivem aqui:
+
+0. **Contexto geografico por baixo dos pontos.** So a nuvem de pontos nao diz
+   onde o Piaui comeca e termina, nem em que territorio cada municipio esta.
+   `contexto()` desenha duas camadas antes dos pontos: uma sombra sobre tudo o
+   que esta FORA do estado (efeito de holofote, feito com um poligono que tem o
+   Piaui como furo) e os 12 territorios de desenvolvimento, unidos a partir dos
+   municipios. As malhas sao do IBGE e ficam versionadas em `geo/`.
 
 1. **Enquadramento fixo no Piaui.** O `st.map` enquadra pelos dados: ao filtrar
    um territorio, o mapa "pula" e some a referencia geografica. Aqui a camera e
@@ -18,7 +25,10 @@ Compartilhado pelas abas que plotam municipios. Tres decisoes vivem aqui:
 
 from __future__ import annotations
 
+import json
 import math
+from collections import defaultdict
+from pathlib import Path
 
 import pandas as pd
 import pydeck as pdk
@@ -27,6 +37,24 @@ import streamlit as st
 # Extremidades do Piaui (N, S, O, L). Delta do Parnaiba no norte, divisa com a
 # Bahia no sul, rio Parnaiba a oeste, divisa com o Ceara a leste.
 PIAUI = (-2.74, -10.93, -45.99, -40.37)
+
+# Malhas do IBGE versionadas junto do app (ver geo/baixar_malhas.py).
+GEO = Path(__file__).resolve().parent / "geo"
+
+# Caixa que cobre folgadamente o entorno do estado. E o anel EXTERNO da mascara:
+# com o Piaui como furo, o preenchimento cai so no que esta fora do estado.
+CAIXA_EXTERNA = [[-60.0, -25.0], [-30.0, -25.0], [-30.0, 8.0], [-60.0, 8.0]]
+
+# Sombreado de fora do estado: escuro e translucido, para o mapa-base ainda
+# aparecer por baixo (rios, divisas dos vizinhos) mas em segundo plano.
+FORA_DO_ESTADO = [8, 12, 22, 130]
+# Territorio sem cor propria — o padrao. Cinza-azulado escuro, de proposito
+# neutro: quem carrega cor na tela sao os pontos, que sao o dado.
+TERRITORIO_NEUTRO = [41, 51, 69, 92]
+# Tom medio das divisas: mais escuro que o mapa-base claro e mais claro que o
+# escuro, entao a linha aparece nos dois temas sem precisar detectar qual e.
+LINHA_TERRITORIO = [120, 132, 150, 205]
+CONTORNO_PIAUI = [236, 240, 245, 235]
 
 # Paleta categorica: 12 matizes distintos (cobre os 12 territorios de
 # desenvolvimento). Ordem escolhida para que vizinhos na lista nao se confundam.
@@ -119,8 +147,106 @@ def raio_por_valor(serie: pd.Series, minimo: int = 6000, maximo: int = 16000) ->
     ]
 
 
+@st.cache_data(show_spinner=False)
+def _malha(arquivo: str) -> dict:
+    """GeoJSON do IBGE lido do disco (cache: o arquivo nao muda em execucao)."""
+    return json.loads((GEO / arquivo).read_text())
+
+
+@st.cache_data(show_spinner=False)
+def _territorios(pertencimento: tuple[tuple[int, str], ...]) -> list[dict]:
+    """Une os municípios de cada território num polígono só.
+
+    Sem dissolver, as divisas MUNICIPAIS apareceriam por dentro de cada
+    territorio e o mapa viraria uma malha de 224 celulas — o oposto de
+    "evidenciar as areas". Unindo, sobra so a divisa entre territorios.
+
+    Roda em ~25 ms para os 224 municipios e fica em cache; a chave e o proprio
+    pertencimento, entao se o refinamento mudar a lotacao de um municipio o
+    desenho acompanha, sem arquivo intermediario para envelhecer.
+    """
+    from shapely.geometry import mapping, shape
+    from shapely.ops import unary_union
+
+    por_territorio = defaultdict(list)
+    de_codigo = dict(pertencimento)
+    for feicao in _malha("municipios.json")["features"]:
+        # `codarea` e o codigo IBGE completo; a tabela guarda sem o prefixo do
+        # estado (2200000 + cod_ibge), a mesma chave do refinamento.
+        codigo = int(feicao["properties"]["codarea"])
+        nome = de_codigo.get(codigo - 2200000)
+        if nome:
+            por_territorio[nome].append(shape(feicao["geometry"]))
+
+    saida = []
+    for nome in sorted(por_territorio):
+        unido = unary_union(por_territorio[nome])
+        geometria = mapping(unido)
+        # PolygonLayer do deck.gl quer sempre lista de aneis: normaliza o
+        # Polygon simples para o mesmo formato do MultiPolygon.
+        partes = (geometria["coordinates"] if geometria["type"] == "MultiPolygon"
+                  else [geometria["coordinates"]])
+        for parte in partes:
+            saida.append({"territorio": nome,
+                          "poligono": [[list(p) for p in anel] for anel in parte]})
+    return saida
+
+
+def contexto(pertencimento: dict[int, str],
+             cores: dict[str, str] | None = None) -> list[pdk.Layer]:
+    """Camadas de fundo: sombra fora do Piauí + os territórios por dentro.
+
+    `pertencimento` e {cod_ibge: territorio} — vem do dado, nao de um arquivo.
+    `cores` pinta cada territorio com a sua cor da legenda; sem ele, todos saem
+    no mesmo tom neutro. A regra: so colorir quando o MAPA ja esta colorindo por
+    territorio, senao dois significados diferentes disputariam a mesma cor (um
+    territorio verde por baixo de um ponto verde de Selo A confunde os dois).
+    """
+    piaui = _malha("piaui.json")["features"][0]["geometry"]["coordinates"]
+
+    # Um poligono com furo: anel externo = a caixa, aneis seguintes = o estado.
+    # E o que produz o efeito de holofote sem precisar recortar o mapa-base.
+    mascara = pdk.Layer(
+        "PolygonLayer",
+        data=[{"poligono": [CAIXA_EXTERNA, *[[list(p) for p in anel] for anel in piaui]]}],
+        get_polygon="poligono",
+        get_fill_color=FORA_DO_ESTADO,
+        stroked=False,
+        pickable=False,
+    )
+
+    areas = _territorios(tuple(sorted(pertencimento.items())))
+    for area in areas:
+        area["_cor"] = (hex_rgb(cores[area["territorio"]]) + [150]
+                        if cores and area["territorio"] in cores else TERRITORIO_NEUTRO)
+    camada_territorios = pdk.Layer(
+        "PolygonLayer",
+        data=areas,
+        get_polygon="poligono",
+        get_fill_color="_cor",
+        get_line_color=LINHA_TERRITORIO,
+        line_width_min_pixels=1,
+        stroked=True,
+        filled=True,
+        pickable=False,
+    )
+
+    contorno = pdk.Layer(
+        "PolygonLayer",
+        data=[{"poligono": [[list(p) for p in anel] for anel in piaui]}],
+        get_polygon="poligono",
+        get_line_color=CONTORNO_PIAUI,
+        line_width_min_pixels=2,
+        stroked=True,
+        filled=False,
+        pickable=False,
+    )
+    # Ordem = ordem de desenho: sombra, areas, contorno — e os pontos por cima.
+    return [mascara, camada_territorios, contorno]
+
+
 def pontos(df: pd.DataFrame, cor: str, tooltip: str, altura: int = 620,
-           raio_m: int | str = 9000) -> None:
+           raio_m: int | str = 9000, base: list[pdk.Layer] | None = None) -> None:
     """Desenha os municipios como circulos coloridos sobre o mapa do estado.
 
     `cor` e a coluna com [r, g, b]. `raio_m` e um valor fixo em metros ou o nome
@@ -145,7 +271,7 @@ def pontos(df: pd.DataFrame, cor: str, tooltip: str, altura: int = 620,
     )
     st.pydeck_chart(
         pdk.Deck(
-            layers=[camada],
+            layers=[*(base or []), camada],
             initial_view_state=visao(altura),
             # None: o Streamlit escolhe o mapa-base claro ou escuro pelo tema.
             map_style=None,

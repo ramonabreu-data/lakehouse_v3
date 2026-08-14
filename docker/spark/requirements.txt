@@ -40,6 +40,10 @@ spacy
 # --- geoespacial ---------------------------------------------------------
 geopandas
 folium
+# O painel importa shapely direto (une os municipios em territorio no mapa).
+# Vinha junto do geopandas, mas depender de transitiva quebra silenciosamente
+# no dia em que o geopandas trocar de backend.
+shapely
 
 # --- apoio ---------------------------------------------------------------
 tqdm
