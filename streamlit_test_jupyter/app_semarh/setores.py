@@ -6,7 +6,7 @@ setor. Cada setor com BI implementado ganha o seu pacote (hoje so
 `chefia_de_gabinete`), para o codigo de um setor nao se misturar com o do outro.
 """
 
-from app_semarh.bis.chefia_de_gabinete import seloambi_2025, seloambi_2026
+from app_semarh.bis.chefia_de_gabinete import acoes_secretario, seloambi_2025, seloambi_2026
 from app_semarh.bis.em_construcao import render_para
 
 SETORES = [
@@ -18,7 +18,7 @@ SETORES = [
         "bis": [
             {"slug": "selo_2026", "titulo": "Selo Ambiental 2026", "render": seloambi_2026.render},
             {"slug": "selo_2025", "titulo": "Selo Ambiental 2025", "render": seloambi_2025.render},
-            {"slug": "acoes_secretario", "titulo": "Ações Secretário", "render": render_para("Ações Secretário")},
+            {"slug": "acoes_secretario", "titulo": "Ações Secretário", "render": acoes_secretario.render},
             {"slug": "compromissos_governo", "titulo": "Compromissos de Governo", "render": render_para("Compromissos de Governo")},
             {"slug": "relatorio_agenda", "titulo": "Relatório Agenda Adm Gov", "render": render_para("Relatório Agenda Adm Gov")},
             {"slug": "pacto_animais", "titulo": "Pacto pelos Animais", "render": render_para("Pacto pelos Animais")},

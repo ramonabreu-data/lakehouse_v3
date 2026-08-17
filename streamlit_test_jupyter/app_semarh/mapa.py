@@ -208,6 +208,9 @@ def contexto(pertencimento: dict[int, str],
     # E o que produz o efeito de holofote sem precisar recortar o mapa-base.
     mascara = pdk.Layer(
         "PolygonLayer",
+        # Todas as camadas levam `id`: e o que o Streamlit exige para o mapa
+        # manter a selecao entre reruns (ver `pontos`).
+        id="fora-do-estado",
         data=[{"poligono": [CAIXA_EXTERNA, *[[list(p) for p in anel] for anel in piaui]]}],
         get_polygon="poligono",
         get_fill_color=FORA_DO_ESTADO,
@@ -221,6 +224,7 @@ def contexto(pertencimento: dict[int, str],
                         if cores and area["territorio"] in cores else TERRITORIO_NEUTRO)
     camada_territorios = pdk.Layer(
         "PolygonLayer",
+        id="territorios",
         data=areas,
         get_polygon="poligono",
         get_fill_color="_cor",
@@ -233,6 +237,7 @@ def contexto(pertencimento: dict[int, str],
 
     contorno = pdk.Layer(
         "PolygonLayer",
+        id="contorno-do-piaui",
         data=[{"poligono": [[list(p) for p in anel] for anel in piaui]}],
         get_polygon="poligono",
         get_line_color=CONTORNO_PIAUI,
@@ -245,17 +250,27 @@ def contexto(pertencimento: dict[int, str],
     return [mascara, camada_territorios, contorno]
 
 
+CAMADA_PONTOS = "pontos"
+
+
 def pontos(df: pd.DataFrame, cor: str, tooltip: str, altura: int = 620,
-           raio_m: int | str = 9000, base: list[pdk.Layer] | None = None) -> None:
+           raio_m: int | str = 9000, base: list[pdk.Layer] | None = None,
+           chave: str | None = None):
     """Desenha os municipios como circulos coloridos sobre o mapa do estado.
 
     `cor` e a coluna com [r, g, b]. `raio_m` e um valor fixo em metros ou o nome
     de uma coluna (veja `raio_por_valor`). O raio acompanha o zoom, mas com piso
     e teto em pixels: o ponto nunca some no zoom do estado inteiro nem vira um
     borrao ao aproximar.
+
+    Com `chave`, o mapa vira **clicavel**: clicar num municipio devolve a linha
+    correspondente (use `municipio_clicado`), e clicar no vazio limpa. Sem
+    `chave`, o mapa e so leitura — que e o padrao das abas que nao usam o
+    clique. A selecao exige `id` em TODAS as camadas, inclusive as de contexto.
     """
     camada = pdk.Layer(
         "ScatterplotLayer",
+        id=CAMADA_PONTOS,
         data=df,
         get_position="[longitude, latitude]",
         get_fill_color=cor,
@@ -269,7 +284,7 @@ def pontos(df: pd.DataFrame, cor: str, tooltip: str, altura: int = 620,
         pickable=True,
         auto_highlight=True,
     )
-    st.pydeck_chart(
+    return st.pydeck_chart(
         pdk.Deck(
             layers=[*(base or []), camada],
             initial_view_state=visao(altura),
@@ -278,7 +293,17 @@ def pontos(df: pd.DataFrame, cor: str, tooltip: str, altura: int = 620,
             tooltip={"html": tooltip, "style": {"fontSize": "12px"}},
         ),
         height=altura,   # largura: 'stretch' (padrao) — acompanha o container
+        key=chave,
+        on_select="rerun" if chave else "ignore",
+        selection_mode="single-object",
     )
+
+
+def municipio_clicado(evento) -> dict | None:
+    """A linha do municipio clicado no mapa, ou None se ninguem foi clicado."""
+    objetos = (getattr(evento, "selection", None) or {}).get("objects") or {}
+    escolhidos = objetos.get(CAMADA_PONTOS) or []
+    return escolhidos[0] if escolhidos else None
 
 
 def legenda_categorias(cores: dict, titulo: str = "Legenda") -> None:

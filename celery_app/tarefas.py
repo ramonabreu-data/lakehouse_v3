@@ -5,14 +5,14 @@ a tarefa `painel.atualizar` refaz o caminho inteiro do dado:
 
 1. **Datasets** — manda o Dremio reler os metadados dos parquets da zona de
    entrada, para enxergar um arquivo novo publicado no MinIO.
-2. **Quem mudou** — compara a assinatura do arquivo de origem de cada edicao com
-   a da carga anterior. So segue adiante a edicao que recebeu arquivo novo: a
-   gravacao Iceberg e integral, entao reprocessar uma edicao intacta so
-   acumularia mais uma copia da mesma tabela no armazem.
+2. **Quem mudou** — compara a assinatura dos arquivos de origem de cada BI com a
+   da carga anterior. So segue adiante o BI que recebeu arquivo novo: a gravacao
+   Iceberg e integral, entao reprocessar um BI intacto so acumularia mais uma
+   copia da mesma tabela no armazem.
 3. **DataFrame + analise** — reexecuta os notebooks de refinamento no Spark (um
-   por edicao do Selo Ambiental), que regravam as tabelas de `refinamento` e os
-   resumos. Sao os mesmos notebooks que uma pessoa roda no JupyterLab: nao ha
-   logica duplicada aqui.
+   por BI: as duas edicoes do Selo Ambiental e as Acoes do Secretario), que
+   regravam as tabelas de `refinamento` e os resumos. Sao os mesmos notebooks
+   que uma pessoa roda no JupyterLab: nao ha logica duplicada aqui.
 4. **Views** — recria as views curadas do space `refinamento`, que sao o caminho
    pelo qual o painel enxerga o dado. Sao elas o contrato: o nome fisico da
    tabela no Nessie pode mudar sem que o Streamlit saiba. Rodam sempre, mesmo
@@ -73,27 +73,31 @@ ZONA_ARMAZEM = os.getenv("ZONA_ARMAZEM", "armazem")
 VARS_ENV = Path(os.getenv("VARS_ENV", "/opt/painel/vars.env"))
 
 # --------------------------------------------------------------------------
-# As edicoes do Selo Ambiental — a UNICA fonte de verdade do pipeline
+# Os BIs do painel — a UNICA fonte de verdade do pipeline
 # --------------------------------------------------------------------------
-# Cada edicao descreve o caminho inteiro do seu dado, do arquivo no MinIO ate a
+# Cada item descreve o caminho inteiro do seu dado, do arquivo no MinIO ate a
 # view que o painel le. Antes isto eram tres listas paralelas (notebooks,
 # arquivos, datasets) mantidas alinhadas por POSICAO — dava para trocar uma sem
 # trocar a outra, e a notificacao so sabia listar tudo achatado, sem dizer o que
-# pertencia a que edicao. Com a edicao como unidade, a mensagem sai organizada
-# de graca e acrescentar uma edicao e acrescentar um item aqui.
+# pertencia a que BI. Com o BI como unidade, a mensagem sai organizada de graca
+# e acrescentar um BI e acrescentar um item aqui.
 #
-# `views` mapeia nome da view -> tabela Iceberg no Nessie que ela expoe. As
-# pastas espelham a navegacao do painel (setor -> familia de BI -> edicao), e
-# quem carrega o ano e a PASTA: por isso os nomes das views se repetem.
-PASTA_VIEWS = ["refinamento", "semarh_painel", "chefia_gabinete", "selos_ambientais"]
+# `caminho` e a pasta das views, do space para baixo, espelhando a navegacao do
+# painel (setor -> familia de BI -> edicao). `views` mapeia nome da view ->
+# tabela Iceberg no Nessie que ela expoe; como quem carrega o ano e a PASTA, os
+# nomes das views se repetem entre as edicoes do Selo Ambiental.
+# `arquivos` sao TODAS as origens do notebook: basta uma delas mudar para o BI
+# ser reprocessado. O dataset do Dremio nao e declarado — sai do caminho do
+# arquivo em `_dataset`, para os dois nunca saírem de sincronia.
+PASTA_VIEWS = ["refinamento", "semarh_painel", "chefia_gabinete"]
+PASTA_SELOS = PASTA_VIEWS + ["selos_ambientais"]
 
 EDICOES = [
     {
         "titulo": "Selo Ambiental 2026",
-        "pasta": "selos_ambientais_2026",
+        "caminho": PASTA_SELOS + ["selos_ambientais_2026"],
         "notebook": "semarh_painel/refinamento_selo_ambiental.ipynb",
-        "arquivo": "sermarh_painel/selo_ambiental_2026.parquet",
-        "dataset": 'minio.entrada."sermarh_painel"."selo_ambiental_2026.parquet"',
+        "arquivos": ["sermarh_painel/selo_ambiental_2026.parquet"],
         "views": {
             "selo_ambiental": "semarh_painel",
             "selo_ambiental_fases": "semarh_painel_fases",
@@ -106,10 +110,9 @@ EDICOES = [
     },
     {
         "titulo": "Selo Ambiental 2025",
-        "pasta": "selos_ambientais_2025",
+        "caminho": PASTA_SELOS + ["selos_ambientais_2025"],
         "notebook": "semarh_painel/refinamento_selo_ambiental_2025.ipynb",
-        "arquivo": "sermarh_painel/selo_ambiental_2025.parquet",
-        "dataset": 'minio.entrada."sermarh_painel"."selo_ambiental_2025.parquet"',
+        "arquivos": ["sermarh_painel/selo_ambiental_2025.parquet"],
         "views": {
             "selo_ambiental": "semarh_painel_2025",
             "selo_ambiental_fases": "semarh_painel_2025_fases",
@@ -118,13 +121,39 @@ EDICOES = [
         },
         "principal": "selo_ambiental_fases",
     },
+    {
+        "titulo": "Ações do Secretário",
+        "caminho": PASTA_VIEWS + ["acoes_secretario"],
+        "notebook": "semarh_painel/refinamento_acoes_secretario.ipynb",
+        # As duas listas de acoes (com e sem agenda politica), a dimensao de
+        # municipios e os dois arquivos de conferencia que o notebook valida.
+        "arquivos": [
+            "sermarh_painel/dados_tabela_acoes_sec+AgPoliti.parquet",
+            "sermarh_painel/dados_tabela_acoes_sec-AgPoliti.parquet",
+            "sermarh_painel/municipios_aderentes_atendidos_.parquet",
+            "sermarh_painel/filtro_acoes_sec+AgPolitica.parquet",
+            "sermarh_painel/filtro_acoes_sec-AgPolitica.parquet",
+        ],
+        "views": {
+            "acoes": "semarh_acoes_secretario",
+            "municipios": "semarh_acoes_secretario_municipios",
+        },
+        "principal": "acoes",
+    },
 ]
 
+
+def _dataset(arquivo: str) -> str:
+    """Caminho do arquivo no MinIO -> nome do dataset promovido no Dremio."""
+    pasta, nome = arquivo.rsplit("/", 1)
+    return f'minio.{ZONA_ENTRADA}."{pasta}"."{nome}"'
+
+
 # Derivados — nada aqui se mantem na mao.
-# A carga so termina bem se TODOS os notebooks passarem: uma edicao com dado
+# A carga so termina bem se TODOS os notebooks passarem: um BI com dado
 # inconsistente nao deixa o painel meio atualizado.
 NOTEBOOKS = [e["notebook"] for e in EDICOES]
-FONTES_BRUTAS = [e["dataset"] for e in EDICOES]
+FONTES_BRUTAS = [_dataset(a) for e in EDICOES for a in e["arquivos"]]
 # Tabela Iceberg -> edicao a que pertence. E o que permite agrupar o manifesto
 # (que vem achatado do `lakehouse.gravar`) por edicao na notificacao.
 EDICAO_DA_TABELA = {
@@ -135,7 +164,7 @@ EDICAO_DA_TABELA = {
 # quebrar, a carga acusa em vez de deixar o painel cair sozinho depois.
 TABELA_CONFERE = os.getenv(
     "TABELA_CONFERE",
-    ".".join(PASTA_VIEWS + [EDICOES[0]["pasta"], EDICOES[0]["principal"]]),
+    ".".join(EDICOES[0]["caminho"] + [EDICOES[0]["principal"]]),
 )
 
 DIAS = ("segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo")
@@ -202,7 +231,7 @@ def _conexao_dremio():
 
 
 def _impressao_origem() -> dict[str, str]:
-    """Assinatura do arquivo de origem de cada edição, direto do MinIO.
+    """Assinatura de cada arquivo de origem, direto do MinIO.
 
     Usa `head_object`: le so os metadados (ETag, tamanho, data), sem baixar o
     arquivo. O ETag do MinIO e o MD5 do conteudo em upload simples, entao a
@@ -220,13 +249,15 @@ def _impressao_origem() -> dict[str, str]:
     )
     impressoes = {}
     for edicao in EDICOES:
-        try:
-            cabecalho = s3.head_object(Bucket=ZONA_ENTRADA, Key=edicao["arquivo"])
-            etag = cabecalho["ETag"].strip('"')
-            impressoes[edicao["arquivo"]] = f"{etag}:{cabecalho['ContentLength']}"
-        except Exception as erro:
-            # Sem assinatura, a edicao NAO e pulada — na duvida, reprocessa.
-            log.warning("não consegui ler a origem de %s: %s", edicao["titulo"], erro)
+        for arquivo in edicao["arquivos"]:
+            try:
+                cabecalho = s3.head_object(Bucket=ZONA_ENTRADA, Key=arquivo)
+                etag = cabecalho["ETag"].strip('"')
+                impressoes[arquivo] = f"{etag}:{cabecalho['ContentLength']}"
+            except Exception as erro:
+                # Sem assinatura, o BI NAO e pulado — na duvida, reprocessa.
+                log.warning("não consegui ler a origem %s (%s): %s",
+                            arquivo, edicao["titulo"], erro)
     return impressoes
 
 
@@ -289,13 +320,14 @@ def _garantir_views(conexao) -> None:
                 raise
         log.info("pasta criada no Dremio: %s", "/".join(caminho))
 
-    # O primeiro nivel e o proprio space, que ja existe e nao se cria por aqui.
-    for nivel in range(2, len(PASTA_VIEWS) + 1):
-        criar_pasta(PASTA_VIEWS[:nivel])
     for edicao in EDICOES:
-        criar_pasta(PASTA_VIEWS + [edicao["pasta"]])
+        # O primeiro nivel e o proprio space, que ja existe e nao se cria por
+        # aqui; os intermediarios sao compartilhados entre os BIs e a criacao e
+        # idempotente, entao criar de novo nao custa nada.
+        for nivel in range(2, len(edicao["caminho"]) + 1):
+            criar_pasta(edicao["caminho"][:nivel])
         for view, tabela in edicao["views"].items():
-            alvo = ".".join(PASTA_VIEWS + [edicao["pasta"], view])
+            alvo = ".".join(edicao["caminho"] + [view])
             conexao.toPandas(
                 f"CREATE OR REPLACE VIEW {alvo} AS "
                 f"SELECT * FROM nessie.refinamento.{tabela} AT BRANCH main"
@@ -372,7 +404,6 @@ def _bloco_edicao(edicao: dict, estado: dict, anteriores: dict[str, int]) -> lis
     """
     linhas_origem = estado.get("linhas_origem") or {}
     publicadas = {t["tabela"]: t["linhas"] for t in (estado.get("tabelas") or [])}
-    total_origem = linhas_origem.get(edicao["dataset"])
     pulada = edicao["titulo"] in (estado.get("puladas") or [])
 
     selo = " · <i>sem mudança</i>" if pulada else " · <b>atualizada</b>"
@@ -380,18 +411,19 @@ def _bloco_edicao(edicao: dict, estado: dict, anteriores: dict[str, int]) -> lis
         f"<b>▊ {html.escape(edicao['titulo'])}</b>{selo}",
         "",
         f"<u>Origem</u> · MinIO, zona <code>{ZONA_ENTRADA}</code>",
-        f"    arquivo · <code>{html.escape(edicao['arquivo'])}</code>"
-        + (f" — {total_origem} linhas" if total_origem is not None else ""),
-        f"    dataset · <code>{html.escape(edicao['dataset'])}</code>",
-        "",
     ]
+    for arquivo in edicao["arquivos"]:
+        total_origem = linhas_origem.get(_dataset(arquivo))
+        linhas.append(f"    • <code>{html.escape(arquivo)}</code>"
+                      + (f" — {total_origem} linhas" if total_origem is not None else ""))
+    linhas.append("")
     if pulada:
         # Edicao intacta: nada foi reescrito. Dizer QUAIS tabelas continuam de pe
         # importa tanto quanto dizer quais mudaram — senao "sem mudança" parece
         # "não tem dado".
         linhas += [
             "<u>Refinamento</u> · <i>não executado</i>",
-            "    o arquivo de origem é o mesmo da carga anterior",
+            "    os arquivos de origem são os mesmos da carga anterior",
             "",
             f"<u>Tabelas</u> · mantidas como estavam, zona <code>{ZONA_ARMAZEM}</code>",
         ]
@@ -419,10 +451,10 @@ def _bloco_edicao(edicao: dict, estado: dict, anteriores: dict[str, int]) -> lis
             linhas.append(f"    • <code>{html.escape(tabela)}</code> — {n} linhas"
                           + _variacao(n, anteriores.get(completo)))
 
-    caminho = " › ".join(PASTA_VIEWS[1:] + [edicao["pasta"]])
+    caminho = " › ".join(edicao["caminho"][1:])
     linhas += [
         "",
-        f"<u>Views</u> · space <code>{PASTA_VIEWS[0]}</code>",
+        f"<u>Views</u> · space <code>{edicao['caminho'][0]}</code>",
         f"    {html.escape(caminho)}",
     ]
     for view in edicao["views"]:
@@ -485,7 +517,7 @@ def _mensagem(estado: dict, anteriores: dict[str, int]) -> str:
         "",
         "━━━━━━━━━━━━━━━━━━",
         "",
-        "<i>Só é reprocessada a edição cujo arquivo de origem mudou; a gravação dessa edição "
+        "<i>Só é reprocessado o BI em que algum arquivo de origem mudou; a gravação desse BI "
         "é integral, e o número em negrito é a variação de linhas desde a última vez que a "
         "tabela foi escrita. As views são recriadas sempre — é metadado, não copia dado.</i>",
     ]
@@ -550,8 +582,13 @@ def atualizar(self, forcar: bool = False) -> dict:
 
     a_processar, pulados = [], []
     for edicao in EDICOES:
-        assinatura = impressoes.get(edicao["arquivo"])
-        inalterada = bool(assinatura) and assinatura == origens_antes.get(edicao["arquivo"])
+        # Basta UM arquivo de origem mudar (ou faltar assinatura) para o BI ser
+        # reprocessado: o notebook cruza todos, entao a tabela publicada depende
+        # do conjunto inteiro.
+        inalterada = all(
+            impressoes.get(arquivo) and impressoes[arquivo] == origens_antes.get(arquivo)
+            for arquivo in edicao["arquivos"]
+        )
         if not forcar and inalterada and _tabelas_no_lugar(conexao_checagem, edicao):
             pulados.append(edicao["titulo"])
         else:
@@ -678,7 +715,7 @@ def atualizar(self, forcar: bool = False) -> dict:
         "atualizado_em": datetime.now(FUSO).isoformat(timespec="seconds"),
         "iniciado_em": agora.isoformat(timespec="seconds"),
         "duracao_s": round(time.monotonic() - inicio, 1),
-        "edicoes": [{"titulo": e["titulo"], "arquivo": e["arquivo"]} for e in EDICOES],
+        "edicoes": [{"titulo": e["titulo"], "arquivos": e["arquivos"]} for e in EDICOES],
         # Assinatura de cada origem: e o que a proxima carga compara para saber
         # se ha arquivo novo. So e gravada quando a carga fecha bem — se um
         # notebook falhar, a assinatura antiga fica e a proxima tenta de novo.

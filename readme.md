@@ -9,7 +9,7 @@ Em cima dessa base rodam três camadas, todas subindo com um `docker compose up 
 | Camada | O que é |
 |---|---|
 | **Lakehouse** | MinIO + Spark + Nessie + Dremio, com as zonas `entrada` / `armazem` / `historico` |
-| **Painel** | app Streamlit com login, servido por HTTPS pelo proxy — hoje com os BIs do Selo Ambiental 2025 e 2026 |
+| **Painel** | app Streamlit com login, servido por HTTPS pelo proxy — hoje com os BIs do Selo Ambiental 2025/2026 e das Ações do Secretário |
 | **Automação** | Celery: recarrega o dado todo dia às 7h, varre o ambiente e avisa no Telegram |
 
 Toda a identidade da implantação — nome do projeto, prefixo de containers e volumes, nomes das zonas
@@ -569,21 +569,22 @@ e no que o painel exibe. Os serviços sobem com o `docker compose up -d`; não h
 | `celery-beat` | Agendador — publica a tarefa às 07:00 |
 | `celery-worker` | Executa a tarefa. Usa a **mesma imagem do Spark**, porque sobe um driver Spark |
 
-Tudo que uma edição do Selo Ambiental tem — arquivo de origem, dataset no Dremio, notebook, tabelas
-e views — é declarado num item da lista `EDICOES`, em [`celery_app/tarefas.py`](celery_app/tarefas.py).
-**Acrescentar uma edição é acrescentar um item ali**: a carga passa a rodar o notebook dela, criar a
-pasta e as views, e a notificação ganha a seção correspondente, sem mais nenhuma alteração.
+Tudo que um BI tem — arquivos de origem, notebook, tabelas e a pasta das views — é declarado num
+item da lista `EDICOES`, em [`celery_app/tarefas.py`](celery_app/tarefas.py). **Acrescentar um BI é
+acrescentar um item ali**: a carga passa a rodar o notebook dele, criar a pasta e as views, e a
+notificação ganha a seção correspondente, sem mais nenhuma alteração. O dataset no Dremio nem é
+declarado — sai do caminho do arquivo, para os dois nunca saírem de sincronia.
 
 O que a tarefa faz:
 
 1. **Datasets** — `ALTER TABLE … REFRESH METADATA` nos parquets da zona de entrada, para o Dremio
    enxergar um arquivo novo publicado no MinIO.
-2. **Quem mudou** — compara a assinatura (ETag + tamanho, via `head_object`, sem baixar nada) do
-   arquivo de origem de cada edição com a da carga anterior. **Só entra na etapa seguinte a edição
-   que recebeu arquivo novo.**
+2. **Quem mudou** — compara a assinatura (ETag + tamanho, via `head_object`, sem baixar nada) dos
+   arquivos de origem de cada BI com a da carga anterior. **Só entra na etapa seguinte o BI em que
+   algum arquivo mudou** (o notebook cruza todos, então basta um).
 3. **DataFrame + análise** — reexecuta os **mesmos notebooks** de refinamento que uma pessoa roda no
-   JupyterLab, **um por edição** do Selo Ambiental (`semarh_painel/refinamento_selo_ambiental.ipynb`
-   e `..._2025.ipynb`), regravando as tabelas de `refinamento` e os resumos. Não há lógica duplicada
+   JupyterLab, **um por BI** (`semarh_painel/refinamento_selo_ambiental.ipynb`, `..._2025.ipynb` e
+   `refinamento_acoes_secretario.ipynb`), regravando as tabelas de `refinamento` e os resumos. Não há lógica duplicada
    entre os notebooks e a tarefa — se as validações de **qualquer** um falharem, a tarefa falha e
    **as tabelas antigas continuam no ar**; nada é publicado pela metade.
 4. **Views** — recria as views curadas do space `refinamento` (pastas pela API REST, views por SQL).
@@ -627,8 +628,7 @@ sexta, 14/08/2026 às 11:04 · carga automática · 3min 54s
 ▊ Selo Ambiental 2026
 
 Origem · MinIO, zona entrada
-    arquivo · sermarh_painel/selo_ambiental_2026.parquet — 224 linhas
-    dataset · minio.entrada."sermarh_painel"."selo_ambiental_2026.parquet"
+    • sermarh_painel/selo_ambiental_2026.parquet — 224 linhas
 
 Refinamento · Spark
     notebook · semarh_painel/refinamento_selo_ambiental.ipynb
@@ -650,6 +650,11 @@ Views · space refinamento
 
 ▊ Selo Ambiental 2025
      (mesma estrutura, com os caminhos de 2025)
+
+━━━━━━━━━━━━━━━━━━
+
+▊ Ações do Secretário
+     (mesma estrutura; a Origem lista os 5 arquivos que o notebook cruza)
 
 ━━━━━━━━━━━━━━━━━━
 
@@ -677,7 +682,7 @@ tabela no `armazem`, mesmo quando nenhum byte mudou. Numa edição encerrada —
 mais arquivo — isso significaria uma cópia nova por dia, para sempre. O efeito era medível: as
 tabelas do painel já tinham acumulado **273 cópias** de 224–672 linhas cada.
 
-Por isso a etapa 2 compara a assinatura do arquivo de origem e **pula a edição intacta**:
+Por isso a etapa 2 compara a assinatura dos arquivos de origem e **pula o BI intacto**:
 
 | Situação | O que acontece | Tempo |
 |---|---|---|
@@ -894,8 +899,8 @@ barras e tabela conferem indicador por indicador).
 
 O que o painel faz além do espelhamento:
 
-- **Filtros** por território, situação e **município** (vazio = todos), persistidos na URL — dá para
-  mandar o link já filtrado.
+- **Filtros** por território, situação e município, persistidos na URL — dá para mandar o link já
+  filtrado. Todos seguem a mesma regra: **começam vazios, e vazio = todos** (ver abaixo).
 - **Clique nas barras** de "tipo de selo" ou "critérios atendidos" recorta o mapa e a tabela; os dois
   gráficos combinam em E. Trocar de fase ou de filtro limpa a seleção.
 - **Mapa** com o Piauí inteiro sempre enquadrado (o zoom não pula ao filtrar), círculo proporcional
@@ -903,7 +908,46 @@ O que o painel faz além do espelhamento:
   ambiental. Por baixo dos pontos, o estado aparece **em destaque**: tudo o que fica fora do Piauí
   recebe uma sombra escura, e os **12 territórios de desenvolvimento** são sombreados com as divisas
   visíveis — ver [Contexto geográfico do mapa](#contexto-geográfico-do-mapa).
+- **Mapa e tabela lado a lado**, com a mesma tabela em HTML da aba das Ações do Secretário: todas as
+  linhas do recorte, sem texto cortado, quadro na altura do mapa (e o interruptor **Largura inteira**
+  para abrir a lista embaixo dele). **Clicar num município do mapa** recorta a tabela para ele —
+  **Ver todos** desfaz. Busca e seletor de ordem no cabeçalho da tabela.
 - **Rodapé** com a data da última carga e, na sidebar, o botão de atualizar na hora.
+
+### Filtros: um botão que resume, a lista de caixas só quando pedida
+
+Um multiselect que nasce com as 12 opções marcadas vira 12 etiquetas na tela — e a soma de dois ou
+três filtros assim (território + ano + mês) ocupava meia tela antes de o usuário ver um número
+sequer. Agora cada filtro é um **botão que resume o estado** — `Território · todos`,
+`Território · 3 de 12` — e as **caixas de seleção** abrem num `st.popover`, por cima do painel, sem
+empurrar nada para baixo. **Nada marcado = todos**, então o estado de repouso é o painel inteiro,
+sem ruído, e marcar algo sempre significa restringir.
+
+Duas decisões dentro do popover:
+
+- **As caixas ficam num `st.form`**: marcar uma caixa não recarrega a tela, nada acontece até o
+  **Aplicar**. Sem isso, escolher cinco territórios seriam cinco recargas do painel inteiro. Já
+  **Todos** (marca tudo) e **Limpar** (desmarca tudo) **não esperam o Aplicar** — cada um já é uma
+  decisão completa, e pedir confirmação para "quero tudo" só atrasaria. A chave das caixas carrega
+  um contador de versão: sem trocá-la, elas ignorariam o estado novo e ficariam como o usuário as
+  deixou. **A mesma versão entra na chave do popover**, e é o que o fecha sozinho ao aplicar — o
+  elemento que renasce é outro, então nasce fechado e o painel já atualizado aparece sem ninguém
+  precisar clicar fora para tirar o filtro da frente.
+- **Tudo marcado = nada marcado = todos.** Os dois dizem "sem recorte", então a URL fica limpa nos
+  dois casos; a diferença é só visual (o *Todos* deixa as caixas marcadas, mostrando o que vale).
+- **Lista longa não vira caixa**: acima de 24 opções (municípios, 224) o popover mostra o campo de
+  busca, porque aí procurar é melhor do que percorrer. O botão de fora é o mesmo.
+
+A regra vive numa função só, [`filtros.py`](streamlit_test_jupyter/app_semarh/filtros.py), então vale
+para todas as abas:
+
+| Função | Devolve quando o campo está vazio | Quando usar |
+|---|---|---|
+| `multiselect_url` | **todas** as opções | o caso comum — quem chama só faz `.isin(...)` e não precisa saber se houve recorte |
+| `multiselect_opcional_url` | `[]` | quando a tela precisa distinguir "sem recorte" de "tudo escolhido" (ex.: só mostrar *"filtrando 3 de 224 municípios"* quando houve filtro) |
+
+O estado continua na URL (`?acoessec_terr=Carnaubais|Entre Rios`) e some dela quando o filtro volta
+a ser "todos" — o link compartilhado carrega o recorte, não o ruído.
 
 ### Contexto geográfico do mapa
 
@@ -954,6 +998,59 @@ no balde `0` para bater com o painel de origem — a legenda abaixo do gráfico 
 caixa (`SÃO GONÇALO DO PIAUÍ` → `São Gonçalo do Piauí`, com conectivos em minúscula, romanos em
 maiúscula e letra maiúscula depois do apóstrofo): 222 dos 224 nomes passam a bater com os de 2026,
 e os 2 restantes divergem na própria fonte. Comparar as duas edições continua sendo por `cod_ibge`.
+
+### BI Ações do Secretário
+
+A agenda do Secretário — quantas ações, em que municípios, quando — em
+[`bis/chefia_de_gabinete/acoes_secretario.py`](streamlit_test_jupyter/app_semarh/bis/chefia_de_gabinete/acoes_secretario.py),
+lendo as views `refinamento.semarh_painel.chefia_gabinete.acoes_secretario.{acoes,municipios}`.
+A tela espelha o painel de origem: os três cartões (**ações**, **cidades visitadas** com o
+percentual, **cidades não visitadas**), o **mapa das ações** e a **tabela-resumo** (data, município,
+território, ação), da mais recente para a mais antiga.
+
+| Filtro | O que faz |
+|---|---|
+| Território · Município · Pactos pelo Piauí | recortam o universo de municípios — e com ele o denominador do percentual de visitadas |
+| Ano · Mês | no painel de origem são botões; aqui persistem na URL (`?acoessec_ano=…`) |
+| **Incluir agenda política** | liga/desliga as ações de agenda política **e** recontar as cidades visitadas |
+
+**A origem publica as ações em duas listas** — com e sem agenda política (`dados_tabela_acoes_sec+
+AgPoliti.parquet` e `…-AgPoliti.parquet`). Em vez de duas tabelas quase idênticas, o refinamento
+publica **uma** e marca `agenda_politica` nas linhas que só existem na lista `+`: o recorte vira um
+interruptor na tela. A **cidade visitada** não é coluna de origem — é município com pelo menos uma
+ação, recalculado a cada filtro. Os arquivos `filtro_acoes_sec*` trazem essa conta pronta e são
+usados no notebook **como validação**: se o derivado divergir, a carga falha em vez de publicar
+número errado.
+
+O painel acrescenta ao original: a série de **ações por mês** — **clicável**, e a barra escolhida
+recorta cartões, mapa e tabela naquele mês (Ctrl+clique escolhe vários; trocar um filtro limpa a
+seleção, porque o mês escolhido pode não existir no novo recorte) —, o seletor do que colore o mapa
+(território, nº de ações ou visita) e o CSV do recorte.
+
+**Mapa e tabela ficam lado a lado**, como no painel de origem, e a tabela aparece **completa**:
+desenhada em HTML ([`tabela.py`](streamlit_test_jupyter/app_semarh/tabela.py), estilo
+`.tabela-completa` em [`estilo.py`](streamlit_test_jupyter/app_semarh/estilo.py)) — o módulo é
+compartilhado com o BI do Selo Ambiental — em vez de `st.dataframe`, porque o
+dataframe corta o texto que não cabe na célula — some justamente a descrição da ação, que é o que se
+quer ler. Em HTML a célula quebra a linha e **todas as linhas do recorte são renderizadas**; o
+quadro tem a altura do mapa e rola por dentro, com o cabeçalho grudado no topo. O interruptor
+**Largura inteira** manda a tabela para baixo do mapa, ocupando a página e sem limite de altura. Em
+troca não há ordenação por clique no cabeçalho: a ordem é um seletor, ao lado da busca. Três visões
+do mesmo recorte:
+
+| Visão | Responde |
+|---|---|
+| **Ações** | o que foi feito e quando — data, município, território e o texto inteiro da ação |
+| **Por município** | onde já se foi, quantas vezes (barra proporcional) e as datas da 1ª e da última visita |
+| **Sem ação** | **quais** cidades ainda não receberam ação — o cartão diz quantas faltam, e essa é a pergunta seguinte de quem monta a agenda |
+
+**Clicar num município do mapa** recorta a tabela para as ações dele (`st.pydeck_chart` com
+`on_select="rerun"`; o município clicado chega em `mapa.municipio_clicado`). O resto da tela não se
+move — é o que permite comparar aquele município com o recorte inteiro —, e **Ver todos** desfaz.
+O clique só existe onde é pedido: `mapa.pontos` só ativa a seleção quando recebe uma `chave`, então
+o mapa do Selo Ambiental segue sendo de leitura.
+O filtro por **órgão** que existe no painel de origem não tem coluna correspondente na planilha;
+quando a origem passar a trazê-la, ele entra junto do filtro de território.
 
 ## Notebooks-modelo
 
@@ -1407,7 +1504,9 @@ dremio-spark-minio/
     │   │       ├── seloambi_2025.py    # aba Selo Ambiental 2025
     │   │       └── seloambi_2026.py    # aba Selo Ambiental 2026
     │   ├── dados.py            # consulta ao Dremio + cache com carimbo
-    │   ├── filtros.py          # filtros persistidos na URL
+    │   ├── filtros.py          # filtros persistidos na URL (vazio = todos)
+    │   ├── tabela.py           # tabela em HTML: todas as linhas, sem cortar texto
+    │   ├── graficos.py         # ajustes comuns dos gráficos (evita os WARN do Vega)
     │   ├── mapa.py             # enquadramento, paletas e legenda do mapa
     │   ├── atualizacao.py      # "Atualizado em", botão manual e histórico
     │   └── estilo.py           # CSS responsivo e molduras

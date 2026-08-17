@@ -35,7 +35,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from app_semarh import mapa
+from app_semarh import graficos, mapa, tabela as tab
 from app_semarh.dados import consultar, estado_atualizacao
 from app_semarh.filtros import multiselect_opcional_url, multiselect_url, selectbox_url
 
@@ -145,6 +145,12 @@ def _recorte(f: pd.DataFrame, sel_selo: list[str], sel_crit: list[str]) -> pd.Da
     return recorte
 
 
+def _limpar_mapa(slug: str) -> None:
+    """Zera o clique no mapa desta edição (chave nova = mapa sem seleção)."""
+    chave = f"_reset_mapa_{slug}"
+    st.session_state[chave] = st.session_state.get(chave, 0) + 1
+
+
 def _limpar_selecao(slug: str) -> None:
     """Zera o clique nos dois graficos DESTA edicao.
 
@@ -187,13 +193,17 @@ def _pertencimento(todas: pd.DataFrame) -> dict[int, str]:
                                       base["territorio_desenvolvimento"])}
 
 
-def _desenhar_mapa(geo: pd.DataFrame, modo: str, pertencimento: dict[int, str]) -> None:
+def _desenhar_mapa(geo: pd.DataFrame, modo: str, pertencimento: dict[int, str],
+                   chave: str):
     """Colore os municipios pelo parametro escolhido e desenha mapa + legenda.
 
     O tamanho do circulo acompanha a pontuacao (area proporcional), como no
     painel de origem: a cor conta o parametro escolhido, o tamanho conta quanto
     o municipio pontuou. Por baixo dos pontos vao o sombreado de fora do estado
     e os territorios (ver `mapa.contexto`).
+
+    Devolve o evento do mapa: e por ele que chega o municipio clicado, que
+    recorta a tabela de pontuacao logo abaixo.
     """
     coluna, tipo = MODOS_MAPA[modo]
     geo["_raio"] = mapa.raio_por_valor(geo["pontos"])
@@ -201,10 +211,10 @@ def _desenhar_mapa(geo: pd.DataFrame, modo: str, pertencimento: dict[int, str]) 
     if tipo == "numero":
         cores, vmin, vmax = mapa.sequencial(geo[coluna])
         geo["_rgb"] = cores
-        mapa.pontos(geo, "_rgb", TOOLTIP, raio_m="_raio",
-                    base=mapa.contexto(pertencimento))
+        evento = mapa.pontos(geo, "_rgb", TOOLTIP, raio_m="_raio",
+                             base=mapa.contexto(pertencimento), chave=chave)
         mapa.legenda_gradiente(vmin, vmax, modo, casas=0 if coluna == "criterios_atendidos" else 1)
-        return
+        return evento
 
     if tipo == "booleano":
         rotulos = geo[coluna].map({True: "Sim", False: "Não"})
@@ -223,9 +233,10 @@ def _desenhar_mapa(geo: pd.DataFrame, modo: str, pertencimento: dict[int, str]) 
     # legenda; nos outros modos elas ficam neutras para nao disputar significado
     # com a cor dos pontos.
     cores_area = cores if coluna == "territorio_desenvolvimento" else None
-    mapa.pontos(geo, "_rgb", TOOLTIP, raio_m="_raio",
-                base=mapa.contexto(pertencimento, cores_area))
+    evento = mapa.pontos(geo, "_rgb", TOOLTIP, raio_m="_raio",
+                         base=mapa.contexto(pertencimento, cores_area), chave=chave)
     mapa.legenda_categorias(cores, modo)
+    return evento
 
 
 def _frescor() -> str:
@@ -258,7 +269,8 @@ def _funil(dados: pd.DataFrame, titulo: str) -> None:
         .mark_bar()
         .encode(
             y=alt.Y("rotulo:N", sort=ordem, title=None),
-            x=alt.X("ini:Q", axis=None, title=None),
+            x=alt.X("ini:Q", axis=None, title=None, stack=None,
+                    scale=graficos.escala(d["fim"].max(), d["ini"].min())),
             x2="fim:Q",
             color=alt.Color(
                 "resultado:N",
@@ -337,6 +349,92 @@ def _balanco(f: pd.DataFrame, edicao: Edicao) -> None:
     st.caption(f"Fonte: `{edicao.fonte}` — via Dremio Arrow Flight. {_frescor()}")
 
 
+ORDENS_TABELA = {
+    "Maior pontuação": ("pontos", False),
+    "Menor pontuação": ("pontos", True),
+    "Município (A–Z)": ("municipio", True),
+    "Critérios atendidos": ("criterios_atendidos", False),
+}
+
+
+def _bloco_mapa(foco: pd.DataFrame, todas: pd.DataFrame, slug: str) -> dict | None:
+    """O mapa com os seus controles. Devolve o município clicado, ou None.
+
+    O enquadramento e sempre o Piaui inteiro (mapa.PIAUI), no maior zoom que
+    cabe: filtrar um territorio muda a nuvem de pontos, nao o recorte.
+    """
+    st.markdown("**Mapa de municípios com selo ambiental**")
+    geo = foco.dropna(subset=["latitude", "longitude"]).copy()
+    if geo.empty:
+        st.caption("Nenhum município com coordenadas nos filtros atuais.")
+        return None
+    c_modo, c_esc = st.columns([2, 1])
+    modo = c_modo.selectbox("Colorir por", list(MODOS_MAPA), key=f"mapa_cor_{slug}")
+    # Padrao igual ao painel de origem: so quem tem selo. Desligue para ver
+    # tambem os nao elegiveis/nao habilitados.
+    so_com_selo = c_esc.toggle("Só com selo", value=True, key=f"mapa_selo_{slug}")
+    if so_com_selo:
+        geo = geo[geo["tem_selo"]]
+    if geo.empty:
+        st.caption("Nenhum município com selo nos filtros atuais.")
+        return None
+    # A chave carrega o contador de "limpar": trocá-la faz o mapa renascer sem
+    # seleção (o estado do clique é read-only).
+    chave = f"mapa_{slug}_{st.session_state.get(f'_reset_mapa_{slug}', 0)}"
+    return mapa.municipio_clicado(
+        _desenhar_mapa(geo, modo, _pertencimento(todas), chave))
+
+
+def _bloco_tabela(foco: pd.DataFrame, edicao: Edicao, clicado: dict | None) -> None:
+    """A tabela de pontuação — inteira, ao lado do mapa.
+
+    Desenhada em HTML (`app_semarh/tabela.py`) para caber ao lado do mapa sem
+    cortar texto: todas as linhas do recorte estao ali, o quadro tem a altura
+    do mapa e rola por dentro. O interruptor **Largura inteira** manda a tabela
+    para baixo do mapa, sem limite de altura.
+    """
+    slug = edicao.slug
+    st.markdown("**Pontuação e resultado dos municípios**")
+    # Clicar num ponto do mapa é a pergunta "e ESTE município?": a tabela
+    # responde, e o resto da tela fica como está, para a comparação com o
+    # recorte inteiro continuar à vista.
+    if clicado and clicado.get("municipio"):
+        foco = foco[foco["municipio"] == clicado["municipio"]]
+        c_txt, c_btn = st.columns([2, 1])
+        c_txt.caption(f"📍 Só **{clicado['municipio']}**, clicado no mapa.")
+        c_btn.button("Ver todos", key=f"limpar_mapa_{slug}", width='stretch',
+                     on_click=_limpar_mapa, args=(slug,))
+
+    c_ordem, c_busca = st.columns([2, 3])
+    busca = c_busca.text_input(
+        "Buscar", key=f"tabela_busca_{slug}", label_visibility="collapsed",
+        placeholder="Buscar por município, resultado ou território…",
+    )
+    altura = None if tab.interruptor_largura(slug) else tab.ALTURA_AO_LADO_DO_MAPA
+
+    # Ordem do painel de origem: pontuacao decrescente. Municipio/Resultado/
+    # Pontos sao as colunas de la; criterios, territorio e pacto vem depois.
+    colunas = [("municipio", "Município", "nome"),
+               ("resultado", "Resultado", "texto"),
+               ("pontos", "Pontos", "decimal"),
+               ("criterios_atendidos", "Critérios", "num"),
+               ("territorio_desenvolvimento", "Território", "texto"),
+               ("pacto_ambiental", "Pacto ambiental", "sim_nao")]
+    # `auditor` so existe nas edicoes cuja fonte traz o nome de quem analisou
+    # (2025 traz; 2026 nao). Detectado no proprio dado para nao virar uma lista
+    # de excecoes por edicao para manter.
+    if "auditor" in foco.columns and foco["auditor"].notna().any():
+        colunas.append(("auditor", "Auditor", "texto"))
+
+    tabela = tab.buscar(foco[[campo for campo, _, _ in colunas]],
+                        ["municipio", "resultado", "territorio_desenvolvimento"], busca)
+    tabela = tab.ordenar(tabela, ORDENS_TABELA, f"selo_{slug}", c_ordem)
+    st.caption(f"Todos os {len(tabela)} município(s) do recorte.")
+    tab.completa(tabela, colunas, altura)
+    tab.baixar(tabela, f"selo_ambiental_{edicao.ano}", f"tabela_{slug}")
+    st.caption(f"Fonte: `{edicao.fonte}` — via Dremio Arrow Flight. {_frescor()}")
+
+
 def render(edicao: Edicao) -> None:
     """Desenha a aba inteira de uma edicao do Selo Ambiental."""
     slug = edicao.slug
@@ -389,16 +487,15 @@ def render(edicao: Edicao) -> None:
     else:
         c_terr, c_sit, c_mun = st.columns(3)
         situacoes = sorted(df["situacao"].dropna().unique())
-        sel_sit = multiselect_url("Situação", situacoes, f"{slug}_sit", c_sit)
-    sel_terr = multiselect_url("Território de desenvolvimento", territorios,
-                               f"{slug}_terr", c_terr)
+        sel_sit = multiselect_url("Situação", situacoes, f"{slug}_sit", c_sit,
+                                  placeholder="todas")
+    sel_terr = multiselect_url("Território", territorios, f"{slug}_terr", c_terr)
     # Municipio: vazio = todos. Serve tanto para comparar um punhado de
     # municipios quanto para isolar um so — vale para KPIs, graficos, mapa e
     # tabela, entao o painel inteiro passa a falar so da selecao.
     sel_mun = multiselect_opcional_url(
         "Município", municipios, f"{slug}_mun", c_mun,
-        ajuda="Deixe vazio para ver todos. Escolha um ou vários para comparar.",
-        placeholder="Todos os municípios",
+        ajuda="Sem nada marcado, entram todos. Escolha um ou vários para comparar.",
     )
 
     f = df[df["territorio_desenvolvimento"].isin(sel_terr) & df["situacao"].isin(sel_sit)].copy()
@@ -424,15 +521,25 @@ def render(edicao: Edicao) -> None:
     # Mesmos quatro cartoes do painel de origem (Looker Studio), na mesma
     # ordem: com selo / nao postulados / nao elegiveis / nao habilitados.
     # A quebra por Selo A/B/C fica no grafico ao lado, como la.
+    # Uma cor por situação (ver `.kpi-*` em `estilo.py`), todas da paleta
+    # categórica do mapa para conversarem com o resto da tela. A ordem é a
+    # distância do selo: conquistou (verde) · nem entrou no processo (roxo) ·
+    # entrou e não alcançou (turquesa) · barrado na habilitação (vermelho).
+    # O âmbar fica de fora porque é o Selo C nos gráficos logo abaixo — reusá-lo
+    # aqui faria duas coisas diferentes dividirem a mesma cor na mesma tela.
     kpis = [
-        ("Municípios com selo", int(f["tem_selo"].sum())),
-        ("Municípios não postulados", int((f["situacao"] == "Não postulado").sum())),
-        ("Municípios não elegíveis", int((f["situacao"] == "Não elegível").sum())),
-        ("Municípios não habilitados", int((f["situacao"] == "Não habilitado").sum())),
+        ("Municípios com selo", int(f["tem_selo"].sum()), "verde"),
+        ("Municípios não postulados",
+         int((f["situacao"] == "Não postulado").sum()), "roxo"),
+        ("Municípios não elegíveis",
+         int((f["situacao"] == "Não elegível").sum()), "turquesa"),
+        ("Municípios não habilitados",
+         int((f["situacao"] == "Não habilitado").sum()), "vermelho"),
     ]
     cartoes = "".join(
-        f'<div class="kpi"><div class="kpi-v">{valor}</div><div class="kpi-l">{rotulo}</div></div>'
-        for rotulo, valor in kpis
+        f'<div class="kpi kpi-{cor}"><div class="kpi-v">{valor}</div>'
+        f'<div class="kpi-l">{rotulo}</div></div>'
+        for rotulo, valor, cor in kpis
     )
     st.markdown(f'<div class="kpi-grid">{cartoes}</div>', unsafe_allow_html=True)
 
@@ -454,12 +561,13 @@ def render(edicao: Edicao) -> None:
             .reset_index(name="municipios").sort_values("municipios")
         )
         ordem_selo = list(por_selo["resultado"])
-        clique_selo = alt.selection_point(name="selo", fields=["resultado"])
+        clique_selo = graficos.selecao("selo", "resultado")
         evento_selo = st.altair_chart(
             alt.Chart(por_selo)
             .mark_bar(cornerRadiusEnd=4)
             .encode(
-                x=alt.X("municipios:Q", title="municípios"),
+                x=alt.X("municipios:Q", title="municípios", stack=None,
+                        scale=graficos.escala(por_selo["municipios"].max())),
                 y=alt.Y("resultado:N", sort=ordem_selo, title=None),
                 color=alt.Color(
                     "resultado:N",
@@ -485,13 +593,14 @@ def render(edicao: Edicao) -> None:
         # criterios" nao sao a mesma coisa.
         por_crit = f.groupby("_faixa").size().reset_index(name="municipios")
         ordem_crit = sorted(por_crit["_faixa"], key=int)
-        clique_crit = alt.selection_point(name="criterios", fields=["_faixa"])
+        clique_crit = graficos.selecao("criterios", "_faixa")
         evento_crit = st.altair_chart(
             alt.Chart(por_crit)
             .mark_bar(cornerRadiusEnd=4)
             .encode(
                 x=alt.X("_faixa:O", sort=ordem_crit, title="critérios atendidos"),
-                y=alt.Y("municipios:Q", title="municípios"),
+                y=alt.Y("municipios:Q", title="municípios", stack=None,
+                        scale=graficos.escala(por_crit["municipios"].max())),
                 # Cada barra sai na cor do selo que aquela quantidade de
                 # criterios produz — a cor passa a contar a regra.
                 color=alt.Color(
@@ -546,63 +655,17 @@ def render(edicao: Edicao) -> None:
     else:
         st.caption("Clique numa barra acima para filtrar o mapa e a tabela.")
 
-    # --- mapa ------------------------------------------------------------
-    # O enquadramento e sempre o Piaui inteiro (mapa.PIAUI), no maior zoom que
-    # cabe: filtrar um territorio muda a nuvem de pontos, nao o recorte.
-    st.markdown("**Mapa de municípios com selo ambiental**")
-    geo = foco.dropna(subset=["latitude", "longitude"]).copy()
-    if geo.empty:
-        st.caption("Nenhum município com coordenadas nos filtros atuais.")
+    # --- mapa e tabela lado a lado, como na aba das Ações do Secretário ----
+    # O layout é escolhido ANTES de desenhar: com a tabela em largura inteira
+    # ela vai para baixo do mapa. O interruptor é desenhado junto da tabela, e
+    # mudá-lo dispara o rerun que reorganiza as duas metades.
+    if tab.largura_inteira(slug):
+        clicado = _bloco_mapa(foco, todas, slug)
+        st.divider()
+        _bloco_tabela(foco, edicao, clicado)
     else:
-        c_modo, c_esc = st.columns([2, 1])
-        modo = c_modo.selectbox("Colorir por", list(MODOS_MAPA), key=f"mapa_cor_{slug}")
-        # Padrao igual ao painel de origem: so quem tem selo. Desligue para ver
-        # tambem os nao elegiveis/nao habilitados.
-        so_com_selo = c_esc.toggle("Só municípios com selo", value=True, key=f"mapa_selo_{slug}")
-        if so_com_selo:
-            geo = geo[geo["tem_selo"]]
-        if geo.empty:
-            st.caption("Nenhum município com selo nos filtros atuais.")
-        else:
-            _desenhar_mapa(geo, modo, _pertencimento(todas))
-
-    st.divider()
-
-    # --- tabela ----------------------------------------------------------
-    st.markdown("**Pontuação e resultado dos municípios**")
-    # Ordem do painel de origem: pontuacao decrescente. Municipio/Resultado/
-    # Pontos sao as colunas de la; criterios, territorio e pacto vem depois.
-    colunas = ["municipio", "resultado", "pontos", "criterios_atendidos",
-               "territorio_desenvolvimento", "pacto_ambiental"]
-    # `auditor` so existe nas edicoes cuja fonte traz o nome de quem analisou
-    # (2025 traz; 2026 nao). Detectado no proprio dado para nao virar uma lista
-    # de excecoes por edicao para manter.
-    if "auditor" in foco.columns and foco["auditor"].notna().any():
-        colunas.append("auditor")
-    tabela = (
-        foco[colunas]
-        .sort_values("pontos", ascending=False, na_position="last")
-        .reset_index(drop=True)
-    )
-    st.dataframe(
-        tabela,
-        width='stretch',
-        hide_index=True,
-        column_config={
-            "municipio": "Município",
-            "resultado": "Resultado",
-            "pontos": st.column_config.NumberColumn("Pontos", format="%.1f"),
-            "criterios_atendidos": st.column_config.NumberColumn("Critérios", format="%d"),
-            "territorio_desenvolvimento": "Território",
-            "pacto_ambiental": st.column_config.CheckboxColumn("Pacto ambiental"),
-            "auditor": "Auditor",
-        },
-    )
-    st.download_button(
-        "Baixar CSV",
-        tabela.to_csv(index=False).encode("utf-8"),
-        file_name=f"selo_ambiental_{edicao.ano}.csv",
-        mime="text/csv",
-        key=f"csv_tabela_{slug}",
-    )
-    st.caption(f"Fonte: `{edicao.fonte}` — via Dremio Arrow Flight. {_frescor()}")
+        c_mapa, c_tabela = st.columns([3, 2])
+        with c_mapa:
+            clicado = _bloco_mapa(foco, todas, slug)
+        with c_tabela:
+            _bloco_tabela(foco, edicao, clicado)
