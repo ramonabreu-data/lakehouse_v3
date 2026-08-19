@@ -1,0 +1,4 @@
+# Instalado so no estagio `dev` da imagem (docker/api/Dockerfile), usado para
+# rodar a suite antes de subir. Nao vai para a imagem de producao.
+-r requirements.txt
+pytest>=8.0,<9.0

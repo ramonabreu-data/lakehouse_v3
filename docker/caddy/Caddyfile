@@ -18,6 +18,16 @@ dremio.{$DOMAIN:localhost} {
 	reverse_proxy dremio:9047
 }
 
+# API de dados refinados (o que aplicacoes externas consomem).
+# Unica rota da stack pensada para consumidor de fora: JSON, CORS e OpenAPI
+# em /docs. Em producao, troque `tls internal` por um dominio publico para o
+# Caddy emitir certificado do Let's Encrypt — cliente HTTP de terceiro nao
+# confia na CA interna.
+api.{$DOMAIN:localhost} {
+	tls internal
+	reverse_proxy api:8000
+}
+
 # Console do MinIO
 minio.{$DOMAIN:localhost} {
 	tls internal

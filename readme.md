@@ -29,14 +29,15 @@ precisa ser editado para atender um novo cliente.
 4. [Passo a passo](#passo-a-passo)
 5. [Atualização automática (Celery)](#atualização-automática-celery)
 6. [Autenticação do dashboard](#autenticação-do-dashboard)
-7. [Painel SEMARH](#painel-semarh)
-8. [Notebooks-modelo](#notebooks-modelo)
-9. [Imagem do Spark/Jupyter](#imagem-do-sparkjupyter)
-10. [Zonas do object store](#zonas-do-object-store)
-11. [Portas e endereços](#portas-e-endereços)
-12. [Validação de ponta a ponta](#validação-de-ponta-a-ponta)
-13. [Segurança](#segurança)
-14. [Estrutura do repositório](#estrutura-do-repositório)
+7. [API de dados refinados](#api-de-dados-refinados)
+8. [Painel SEMARH](#painel-semarh)
+9. [Notebooks-modelo](#notebooks-modelo)
+10. [Imagem do Spark/Jupyter](#imagem-do-sparkjupyter)
+11. [Zonas do object store](#zonas-do-object-store)
+12. [Portas e endereços](#portas-e-endereços)
+13. [Validação de ponta a ponta](#validação-de-ponta-a-ponta)
+14. [Segurança](#segurança)
+15. [Estrutura do repositório](#estrutura-do-repositório)
 
 ---
 
@@ -130,12 +131,13 @@ e avisa no Telegram — ver [Atualização automática](#atualização-automáti
 | **Celery + Redis** | Agenda e executa a carga diária; Redis é a fila | Tira o "alguém precisa rodar o notebook" do processo, e dá histórico do que rodou |
 | **PostgreSQL / MongoDB** | Bancos de origem de exemplo | Representam os sistemas que já existem na casa e viram fonte federada no Dremio |
 
-### Os 13 serviços
+### Os 14 serviços
 
 | Serviço | Papel | Publicado |
 |---|---|---|
 | `caddy` | Proxy reverso com TLS — **único** ponto de entrada da rede | 80/443 |
 | `dashboard` | Painel Streamlit | via proxy |
+| `api` | API JSON dos dados refinados, para aplicações externas | via proxy / loopback |
 | `dremio` | Query engine federada (UI + SQL + Arrow Flight) | via proxy / loopback |
 | `spark` | Spark + JupyterLab (escrita Iceberg, notebooks) | via proxy / loopback |
 | `minio` | Object store (as três zonas) | via proxy / loopback |
@@ -860,6 +862,280 @@ docker compose logs -f dashboard
 
 ---
 
+## API de dados refinados
+
+O painel Streamlit consome o lakehouse por dentro da rede. Para entregar o **mesmo dado refinado a
+uma aplicação externa** — um site, um app, o sistema de outra secretaria — existe o serviço `api`:
+um FastAPI que lê as views curadas do space `refinamento` e devolve JSON.
+
+O código fica em [`api/`](api/); a imagem em [`docker/api/Dockerfile`](docker/api/Dockerfile).
+
+### Por que uma API própria, e não o REST do Dremio
+
+O Dremio já tem `/api/v3/sql`, e ele sai pelo proxy em `https://dremio.localhost`. Só que usá-lo
+direto significa entregar **credencial de banco** para a aplicação externa e, com ela, o catálogo
+inteiro — inclusive as camadas cruas e as fontes conectadas (Postgres, Mongo). Fora isso, o fluxo é
+assíncrono (submete job → faz *polling* → pagina resultados): cada consumidor teria de reimplementar
+essa dança.
+
+O ganho decisivo, porém, é o **desacoplamento**. Na API o contrato público é o *slug* do conjunto,
+não o nome da view:
+
+```
+/v1/conjuntos/selo-ambiental-2026-fases/dados
+        ↓  (api/app/catalogo/areas/chefia_de_gabinete/selo_ambiental.py)
+refinamento.semarh_painel.chefia_gabinete.selos_ambientais.selos_ambientais_2026.selo_ambiental_fases
+```
+
+A view pode ser renomeada, reparticionada ou trocada de engine que a URL continua a mesma. Se o nome
+da view fosse o contrato, qualquer refatoração no lakehouse quebraria um app de terceiro — e o
+lakehouse congelaria.
+
+### As camadas
+
+A API é organizada em cinco camadas, cada uma com uma pergunta só. A regra de
+dependência aponta sempre para dentro: `web` conhece `servicos`, que conhece `motores` e
+`catalogo`, que conhecem `nucleo` — e o `nucleo` não conhece ninguém.
+
+| Camada | Responde | Não sabe |
+|---|---|---|
+| `nucleo/` | o que é um Conjunto; o que o cliente pediu | HTTP, SQL, rede |
+| `catalogo/` | **o que** é publicado (só declaração) | como se consulta |
+| `motores/` | **como** se consulta cada tecnologia | quem chamou |
+| `servicos/` | orquestra: valida → motor → cache | HTTP |
+| `web/` | rotas, autenticação, erros, documentação | de onde vem o dado |
+
+O ponto que essa divisão compra: **`web/` não sabe que existe Dremio**. A suíte prova
+isso ao montar a API inteira com um motor falso — se alguma rota conhecesse SQL, o teste
+não passaria.
+
+### Onde mexer quando chega demanda nova
+
+| Demanda | Onde |
+|---|---|
+| publicar mais um dataset do Dremio | um `Conjunto` em `catalogo/areas/<area>/` |
+| um setor novo (outra área) | pacote novo em `catalogo/areas/`, com a `AREA` |
+| **uma fonte de dados nova** (Postgres, Mongo, API externa) | pacote novo em `motores/`, registrado em `motores/__init__.py` |
+| um operador de filtro novo | `nucleo/pedido.py` + tradução em cada motor |
+| mudar formato de resposta | `servicos/dados.py` |
+| mudar texto do `/docs` | `web/documentacao.py` |
+
+### O contrato: `api/app/catalogo/`
+
+**Só o que está no catálogo existe para o mundo.** Não há endpoint que aceite SQL, e nenhum
+identificador (coluna, campo de filtro, agrupamento) vem da requisição: o cliente escolhe *entre* os
+que o catálogo declara.
+
+O catálogo é organizado **na mesma divisão do painel** (`app_semarh/bis/<setor>/<bi>.py`), para que
+cada demanda nova entre no seu lugar sem mexer no que já existe:
+
+```
+api/app/catalogo/
+├── __init__.py              # registro + conferência (roda no import)
+└── areas/
+    ├── __init__.py          # AREAS e MODULOS — o índice de tudo
+    └── chefia_de_gabinete/
+        ├── __init__.py      # a AREA (vira seção no /docs)
+        ├── selo_ambiental.py    # motor: serve as duas edições, como no painel
+        ├── seloambi_2026.py     # edição 2026 (sem auditor)
+        ├── seloambi_2025.py     # edição 2025 (com auditor)
+        └── acoes_secretario.py  # ações + cobertura por município
+```
+
+**Publicar dado novo** — três passos, nenhuma rota escrita à mão:
+
+1. no módulo da área, acrescente um `Conjunto` à tupla `CONJUNTOS` (slug, fonte, campos, quais
+   aceitam filtro, quais agrupam);
+2. se for área nova, crie o pacote com a `AREA` no `__init__.py`;
+3. registre o módulo em `MODULOS` (e a área em `AREAS`) no `areas/__init__.py`.
+
+As três rotas (`campos`, `dados`, `resumo`) e a seção no `/docs` são **geradas a partir daí**.
+
+O catálogo é conferido no import: slug repetido, campo com tipo desconhecido, motor inexistente ou
+`ordem_padrao` apontando para coluna que não existe **derrubam a subida**, em vez de virarem erro na
+primeira consulta do cliente.
+
+### Acrescentar uma fonte de dados
+
+Cada conjunto declara de onde vem: `Fonte(motor, endereço)`. Hoje só existe o motor `dremio`, mas
+o caminho para o segundo já está aberto — crie `api/app/motores/<nome>/` expondo três coisas:
+
+```python
+NOME = "planilha"                     # o que vai em Fonte(motor=...)
+def conferir_fonte(fonte) -> None     # valida o endereço no import do catálogo
+def construir(config) -> Motor        # recebe a Configuração e devolve o motor
+```
+
+O `Motor` responde três perguntas — `dados`, `total`, `resumo` — recebendo o pedido **já validado**
+pelo núcleo (valores convertidos para `int`, `date`, `bool`). Ele não revalida nada e não conhece
+quem chamou. Registre o módulo em `motores/__init__.py`, aponte a `Fonte` do conjunto para o nome
+novo, e as rotas, os filtros, o cache, o limite e a documentação continuam funcionando iguais.
+
+O formato de troca entre motor e serviço é uma tabela **Arrow** — não por ser detalhe do Dremio, mas
+por ser a moeda do lakehouse (Flight fala Arrow, Iceberg é lido como Arrow), o que evita uma
+conversão à toa no meio do caminho.
+
+#### Conjuntos publicados
+
+As dez views do space `refinamento` — as três que o painel lê na tela e as demais que o mesmo
+refinamento produz:
+
+| Slug | View no `refinamento` | O que é |
+|---|---|---|
+| `selo-ambiental-2026` | `…selos_ambientais_2026.selo_ambiental` | resultado consolidado, 1 linha por município |
+| `selo-ambiental-2026-fases` | `…selos_ambientais_2026.selo_ambiental_fases` | 1 linha por município **e** fase — a base do BI |
+| `selo-ambiental-2026-por-selo` | `…selos_ambientais_2026.por_tipo_de_selo` | municípios por resultado (já agregado) |
+| `selo-ambiental-2026-por-criterios` | `…selos_ambientais_2026.por_criterios_atendidos` | municípios por nº de critérios (já agregado) |
+| `selo-ambiental-2025…` | idem, em `selos_ambientais_2025` | as mesmas quatro views, mais a coluna `auditor` |
+| `acoes-secretario` | `…acoes_secretario.acoes` | 1 linha por ação realizada |
+| `municipios-acoes` | `…acoes_secretario.municipios` | cobertura: ações e visitas por município |
+
+### Endpoints
+
+| Rota | Para quê |
+|---|---|
+| `GET /saude` | vivacidade — não toca o Dremio (é o healthcheck do compose) |
+| `GET /saude/pronto` | prontidão — roda um `SELECT 1` no Dremio |
+| `GET /docs` | OpenAPI navegável; `/openapi.json` para gerar cliente |
+| `GET /v1/identidade` | **confere a credencial** e diz quem você é (200) ou não (401) |
+| `GET /v1/areas` | as áreas que publicam conjuntos |
+| `GET /v1/conjuntos` | o que está publicado (ponto de partida da integração) |
+| `GET /v1/conjuntos/{slug}` | campos, tipos, quais são filtráveis e agrupáveis |
+| `GET /v1/conjuntos/{slug}/dados` | registros, com filtro, ordenação e paginação |
+| `GET /v1/conjuntos/{slug}/resumo` | agregação calculada no Dremio |
+
+No `/docs` **cada conjunto tem a sua própria seção**, com a descrição do que entrega, a view de
+origem e a tabela de campos — quais aceitam filtro, quais agrupam e o que cada um significa. Os
+caminhos são gerados com o slug literal (`/v1/conjuntos/acoes-secretario/dados`), então o que a
+página mostra é exatamente a URL que a aplicação vai chamar.
+
+Filtros na *query string* — qualquer campo marcado como filtrável:
+
+```
+?municipio=Fortaleza                  igualdade
+?pontos__gte=70&pontos__lt=90         comparação (gte, lte, gt, lt, ne)
+?cod_ibge__in=2304400,2312908         lista
+?municipio__contem=for                busca em texto (ignora maiúscula/minúscula)
+?auditor__nulo=true                   ausência de valor
+```
+
+Reservados: `colunas`, `ordenar_por`, `ordem`, `limite` (padrão 100, teto 5.000), `deslocamento`,
+`incluir_total`.
+
+O `/resumo` existe para a aplicação web **não** ter de baixar a tabela inteira só para contar:
+
+```bash
+curl -H "X-API-Key: $CHAVE" \
+  "https://api.localhost/v1/conjuntos/selo-ambiental-2026/resumo?agrupar_por=selo&metrica=pontos&funcao=media"
+```
+
+```json
+{"dados": [{"selo": "A", "registros": 210, "pontos_media": 190.30}, ...]}
+```
+
+### Autenticação
+
+Duas formas, as duas já emitíveis pela stack. Sem uma delas a resposta é `401`.
+
+| Modo | Cabeçalho | Para quem |
+|---|---|---|
+| Chave de API | `X-API-Key: <chave>` | aplicação servidor-a-servidor |
+| JWT do Supabase | `Authorization: Bearer <token>` | app web com usuário logado — o **mesmo** token que o painel recebe no login |
+
+As chaves ficam em `API_CHAVES` no `.env`, no formato `nome:chave` separado por vírgula (o nome só
+aparece no log, para saber quem chamou). Gere as suas com:
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+**Testando pelo `/docs`** — os dois modos são declarados como esquemas de segurança do OpenAPI, então
+a página tem o botão **Authorize** (canto superior direito):
+
+| No diálogo | O que colar |
+|---|---|
+| `ChaveDeAplicacao (apiKey)` | a chave do `API_CHAVES`, sem o prefixo `nome:` |
+| `TokenSupabase (http, Bearer)` | o `access_token` do GoTrue — **sem** escrever `Bearer` na frente |
+
+Preencha **um** dos dois e clique em *Authorize*. Daí em diante o *Try it out* de qualquer endpoint
+já vai autenticado, e a credencial sobrevive ao F5 da página (`persistAuthorization`).
+
+Para conferir uma credencial sem abrir o navegador, `GET /v1/identidade` responde **200** com quem
+você é, ou **401** se a credencial não vale:
+
+```bash
+curl -k -H "X-API-Key: $CHAVE" https://api.localhost/v1/identidade
+# {"tipo":"aplicacao","nome":"painel-web"}
+```
+
+Para pegar um token do Supabase na mão:
+
+```bash
+curl -s -X POST 'http://127.0.0.1:9999/token?grant_type=password' \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"...","password":"..."}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])'
+```
+
+> O GoTrue desta stack sobe **sem** `GOTRUE_JWT_AUD` e emite `aud` vazio, então a API não confere o
+> público por padrão. Numa instalação que defina esse público, aponte `API_JWT_PUBLICO` para ele.
+
+### Cache, limite e CORS
+
+- **Cache** no Redis (banco 1; o 0 é a fila do Celery). A chave inclui o **carimbo da última carga**
+  lido de `/estado/atualizacao.json` — a mesma lógica do painel: dado novo invalida tudo na hora, sem
+  esperar o TTL. Medido nesta stack: 146 ms na 1ª chamada, 8,7 ms na 2ª. Redis fora do ar não derruba
+  a API; ela só responde mais devagar.
+- **Limite** de `API_LIMITE_POR_MINUTO` requisições por minuto, por identidade (chave ou usuário).
+  Sem isso, uma API na internet é um `SELECT` no lakehouse a cada clique de quem quiser.
+- **CORS** em `API_CORS_ORIGENS`. `*` serve qualquer aplicação web (a credencial vai em cabeçalho,
+  não em cookie); em produção, prefira listar os domínios.
+
+### Variáveis (no `.env` da stack)
+
+```bash
+# conta de serviço do Dremio — a MESMA do vars.env do painel, declarada aqui de
+# propósito: assim o container da API recebe só estas duas variáveis, em vez de
+# enxergar o vars.env inteiro (COOKIE_SECRET, senha do usuário master...).
+DREMIO_USERNAME=...
+DREMIO_PASSWORD=...
+
+API_CHAVES=nome-da-aplicacao:chave-gerada     # vazio + API_AUTH_ATIVA=true = não sobe
+API_CORS_ORIGENS=*                            # ou https://app.exemplo.gov.br,https://outro
+API_AUTH_ATIVA=true                           # false abre a API — só em desenvolvimento
+API_CACHE_TTL=300
+API_LIMITE_POR_MINUTO=120
+API_PORTA_LOCAL=8010                          # loopback, para teste sem passar pelo proxy
+```
+
+Com `API_AUTH_ATIVA=true` e nenhuma credencial configurada, a API **falha ao subir** em vez de ficar
+aberta em silêncio.
+
+### Testes
+
+A suíte roda sem a stack de pé — o Dremio é dublado, e o que se verifica é o SQL que a API *pede*:
+
+```bash
+docker build -f docker/api/Dockerfile --target dev -t plataforma/api:test api
+docker run --rm plataforma/api:test
+```
+
+Cobre o montador de SQL (incluindo tentativas de injeção), autenticação nos dois modos, serialização
+de data/decimal/NaN, cache, limite, CORS e os códigos de erro. O estágio `dev` da imagem não vai para
+produção.
+
+### Levar para produção
+
+O que já está pronto: JSON, CORS, paginação, OpenAPI, contrato desacoplado, autenticação, limite,
+usuário sem privilégio no container. Falta **um** passo, que é de infraestrutura e não de código:
+
+> O Caddy usa `tls internal` com `DOMAIN=localhost` — CA própria, em que **cliente HTTP de terceiro
+> não confia**. Para servir aplicação de fora, aponte um domínio público para a máquina, troque
+> `DOMAIN` no `.env` e remova o `tls internal` do bloco `api` no
+> [`Caddyfile`](docker/caddy/Caddyfile): o Caddy emite e renova o certificado do Let's Encrypt
+> sozinho. Enquanto isso não acontece, a API atende no host e na rede interna.
+
+---
+
 ## Painel SEMARH
 
 O app Streamlit tem dois níveis de navegação, ambos espelhados na URL: **áreas** (botões na
@@ -1345,6 +1621,7 @@ redirecionado para HTTPS.
 | Interface | URL (via proxy) | Backend |
 |---|---|---|
 | Dashboard (Streamlit) | `https://dashboard.localhost` | dashboard:8501 |
+| API de dados refinados | `https://api.localhost` (docs em `/docs`) | api:8000 |
 | Dremio (UI + REST) | `https://dremio.localhost` | dremio:9047 |
 | MinIO (console) | `https://minio.localhost` | minio:9001 |
 | JupyterLab (exige `JUPYTER_TOKEN`) | `https://jupyter.localhost` | spark:8888 |
@@ -1354,7 +1631,8 @@ depuração local, ou ficam apenas na rede interna do Docker:
 
 | Serviço | Acesso | Uso |
 |---|---|---|
-| Dremio Arrow Flight | `127.0.0.1:32010` | SQL via Flight (usado pelo Streamlit) |
+| Dremio Arrow Flight | `127.0.0.1:32010` | SQL via Flight (usado pelo Streamlit e pela API) |
+| API de dados refinados | `127.0.0.1:8010` (`API_PORTA_LOCAL`) | teste local sem passar pelo proxy |
 | Dremio ODBC/JDBC | `127.0.0.1:31010` | conector legado |
 | MinIO API S3 | `127.0.0.1:9000` | clientes S3 |
 | Spark UIs | `127.0.0.1:8080/8081/18080/4040-4045` | Master/Worker/History/jobs |
@@ -1471,6 +1749,7 @@ dremio-spark-minio/
 │   ├── spark/                        # imagem propria do Spark/Jupyter (também roda o Celery)
 │   │   ├── Dockerfile
 │   │   └── requirements.txt          # libs de DS/ML + streamlit-cookies-manager
+│   ├── api/Dockerfile                # imagem enxuta da API (python-slim, ~400 MB)
 │   ├── caddy/Caddyfile               # reverse proxy TLS (subdomínios + CA interna)
 │   └── supabase-init.sql             # schema `auth` do GoTrue (1º boot do supabase-db)
 ├── notebooks/                        # modelos, montados em /workspace/notebooks
@@ -1486,6 +1765,47 @@ dremio-spark-minio/
 │   ├── 10_tratamento.ipynb
 │   ├── 20_publicar.ipynb
 │   └── README.md
+├── api/                  # API de dados refinados (serviço `api`)
+│   ├── app/
+│   │   ├── nucleo/             # o que a API É: tipos e pedido. Sem HTTP, sem SQL
+│   │   │   ├── tipos.py            # Area, Conjunto, Campo, Fonte
+│   │   │   ├── pedido.py           # query string -> Consulta/Resumo tipados
+│   │   │   └── erros.py            # erros de negócio (sem status HTTP)
+│   │   ├── catalogo/           # O QUE é publicado — só declaração
+│   │   │   ├── __init__.py         # registro + conferência no import
+│   │   │   └── areas/
+│   │   │       ├── __init__.py     # AREAS e MODULOS: o índice de tudo
+│   │   │       └── chefia_de_gabinete/
+│   │   │           ├── selo_ambiental.py   # motor das duas edições
+│   │   │           ├── seloambi_2026.py    # edição 2026
+│   │   │           ├── seloambi_2025.py    # edição 2025 (tem auditor)
+│   │   │           └── acoes_secretario.py
+│   │   ├── motores/            # COMO se consulta cada fonte (extensível)
+│   │   │   ├── base.py             # o contrato que toda fonte cumpre
+│   │   │   ├── arrow.py            # Arrow -> JSON (data, decimal, NaN)
+│   │   │   ├── __init__.py         # registro: acrescente a fonte nova aqui
+│   │   │   └── dremio/
+│   │   │       ├── sql.py          # pedido -> SQL (único lugar que escreve SQL)
+│   │   │       ├── cliente.py      # Arrow Flight + login com renovação
+│   │   │       └── __init__.py     # o motor: amarra sql.py e cliente.py
+│   │   ├── servicos/           # orquestração: valida -> motor -> cache
+│   │   │   ├── dados.py            # o caminho de toda requisição de dado
+│   │   │   ├── cache.py            # Redis, invalidado pelo carimbo da carga
+│   │   │   ├── limite.py           # requisições por minuto, por identidade
+│   │   │   └── estado.py           # carimbo da última carga do refinamento
+│   │   ├── web/                # HTTP: a única camada que conhece FastAPI
+│   │   │   ├── acesso.py           # autenticação + limite (e o botão Authorize)
+│   │   │   ├── erros.py            # erro de negócio -> status code
+│   │   │   ├── documentacao.py     # textos do /docs, gerados do catálogo
+│   │   │   └── rotas/
+│   │   │       ├── descoberta.py   # /identidade, /areas, /conjuntos
+│   │   │       └── conjuntos.py    # fábrica das 3 rotas de cada conjunto
+│   │   ├── seguranca.py        # chave de API e JWT do Supabase
+│   │   ├── configuracao.py     # variáveis de ambiente
+│   │   └── principal.py        # criar_app(): liga todas as camadas
+│   ├── tests/                  # suíte (roda sem stack de pé; ver docker/api)
+│   ├── requirements.txt
+│   └── requirements-dev.txt
 ├── seed/
 │   ├── minio-data/       # arquivos enviados para a zona de entrada no primeiro boot
 │   ├── mongo/            # 001_init.js  — roda no primeiro boot do Mongo

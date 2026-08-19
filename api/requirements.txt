@@ -1,0 +1,15 @@
+# Dependencias da API de dados refinados (servico `api`).
+# Imagem propria e enxuta: NAO reusa a do Spark (~17 GB, torch/tensorflow) —
+# a API so precisa falar Arrow Flight com o Dremio e servir JSON.
+
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+# Cliente Arrow Flight. Falamos com o Dremio direto pelo pyarrow, sem o
+# dremio-simple-query do painel: ele arrasta pandas, polars e duckdb junto.
+pyarrow>=17,<22
+# Login no Dremio (/apiv2/login) — mesma rota que o painel usa.
+httpx>=0.27,<1.0
+# Validacao dos JWT emitidos pelo Supabase GoTrue da stack.
+pyjwt>=2.9,<3.0
+# Cache das respostas e janela de limite de requisicoes.
+redis>=5.0,<7.0

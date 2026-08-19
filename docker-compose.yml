@@ -129,6 +129,69 @@ services:
     networks: [interna]
 
   # ---------------------------------------------------------------------------
+  # API de dados refinados. E a porta de saida do lakehouse para aplicacoes de
+  # TERCEIROS: entrega em JSON as views curadas do space `refinamento`, com
+  # contrato proprio (slug por conjunto), autenticacao, cache e limite de uso.
+  #
+  # Imagem propria e enxuta (python:3.12-slim, ~400 MB) em vez da do Spark:
+  # a API so fala Arrow Flight com o Dremio. Ver docker/api/Dockerfile.
+  #
+  # O que ela publica esta em api/app/catalogo.py — nada fora dali e alcancavel.
+  # ---------------------------------------------------------------------------
+  api:
+    platform: linux/amd64
+    build:
+      context: ./api
+      dockerfile: ../docker/api/Dockerfile
+      target: producao
+    image: ${PROJETO}/api-dados:1.0
+    container_name: ${PROJETO}_api
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=America/Fortaleza
+      # Conta de servico do Dremio. A MESMA do painel, mas declarada no .env em
+      # vez de montar o vars.env: a API e o servico mais exposto da stack e nao
+      # tem por que enxergar COOKIE_SECRET nem a senha do usuario master.
+      - DREMIO_ENDPOINT=dremio:9047
+      - DREMIO_FLIGHT_ENDPOINT=dremio:32010
+      - DREMIO_USERNAME=${DREMIO_USERNAME:?configure DREMIO_USERNAME no .env}
+      - DREMIO_PASSWORD=${DREMIO_PASSWORD:?configure DREMIO_PASSWORD no .env}
+      # Quem pode chamar: chaves de aplicacao e/ou JWT do Supabase da stack.
+      - API_AUTH_ATIVA=${API_AUTH_ATIVA:-true}
+      - API_CHAVES=${API_CHAVES:-}
+      - JWT_SECRET=${JWT_SECRET}
+      # Origens liberadas para o navegador. `*` serve qualquer aplicacao web.
+      - API_CORS_ORIGENS=${API_CORS_ORIGENS:-*}
+      - API_CACHE_TTL=${API_CACHE_TTL:-300}
+      - API_LIMITE_POR_MINUTO=${API_LIMITE_POR_MINUTO:-120}
+      - API_TEMPO_LIMITE_CONSULTA=${API_TEMPO_LIMITE_CONSULTA:-60}
+      # Banco 1 do Redis: o 0 e a fila do Celery.
+      - API_REDIS_URL=redis://redis:6379/1
+      - ARQUIVO_ESTADO=/estado/atualizacao.json
+    volumes:
+      # Carimbo da ultima carga, so leitura. Entra na chave do cache: dado novo
+      # invalida as respostas guardadas na hora, sem esperar o TTL.
+      - painel-estado:/estado:ro
+    ports:
+      # So loopback, para teste local (8000 costuma estar tomada por outro
+      # projeto na maquina). O acesso externo e por https://api.${DOMAIN}.
+      - "127.0.0.1:${API_PORTA_LOCAL:-8010}:8000"
+    healthcheck:
+      # A imagem slim nao tem curl; o proprio python resolve.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/saude')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    depends_on:
+      dremio:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    networks: [interna]
+
+  # ---------------------------------------------------------------------------
   # Atualizacao automatica do painel (Celery). Sobe junto com a stack: todo dia
   # as HORA_ATUALIZACAO (07:00, fuso America/Fortaleza) o worker refaz dataset
   # -> tabelas refinadas -> carimbo lido pelo dashboard. O botao "Atualizar
@@ -400,7 +463,7 @@ services:
       - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
-    depends_on: [dremio, spark, minio, dashboard]
+    depends_on: [dremio, spark, minio, dashboard, api]
     networks: [interna]
 
 volumes:
