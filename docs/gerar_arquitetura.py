@@ -75,9 +75,38 @@ ETAPAS = [
      [("png", "nessie.png"), ("png", "iceberg.png")]),
     ("Dremio", "views curadas por edição",
      [("png", "dremio.png")]),
-    ("Streamlit", "painel SEMARH",
-     [("si", "streamlit")]),
 ]
+
+# O caminho do dado termina no Dremio. Daí para frente sao CONSUMIDORES, e eles
+# sao paralelos — nao uma etapa depois da outra. Por isso a ultima coluna se
+# divide em dois cartoes empilhados, com a seta do Dremio se bifurcando: o
+# painel e a API leem a MESMA view curada, cada um para o seu publico.
+CONSUMIDORES = [
+    ("Streamlit", "o painel SEMARH", ("si", "streamlit")),
+    ("API de dados", "aplicações externas", ("glifo", "{ }")),
+]
+
+
+def glifo_api(x: float, y: float, lado: float) -> str:
+    """Marca da API. Nao ha logo de marca aqui — a API e nossa, nao de terceiro.
+
+    As chaves lem como JSON em qualquer lugar, e nao fingem ser a logo de um
+    framework que por acaso usamos por dentro.
+    """
+    return (f'<rect x="{x:.1f}" y="{y:.1f}" width="{lado}" height="{lado}" rx="7" '
+            f'fill="{DESTAQUE}" opacity="0.12"/>'
+            f'<text x="{x + lado / 2:.1f}" y="{y + lado * 0.71:.1f}" text-anchor="middle" '
+            f'font-family="DejaVu Sans Mono, monospace" font-size="{lado * 0.62:.0f}" '
+            f'font-weight="700" fill="{DESTAQUE}">{{ }}</text>')
+
+
+def desenhar_logo(logo, x: float, y: float, lado: float) -> str:
+    """Um logo, seja ele do simple-icons, bitmap ou o glifo da API."""
+    if logo[0] == "si":
+        return icone(logo[1], x, y, lado)
+    if logo[0] == "png":
+        return icone_png(logo[1], x, y, lado)
+    return glifo_api(x, y, lado)
 
 
 def desenhar_logos(logos, centro_x: float, topo_y: float, lado: float) -> str:
@@ -86,11 +115,7 @@ def desenhar_logos(logos, centro_x: float, topo_y: float, lado: float) -> str:
     inicio = centro_x - (len(logos) * passo - 12) / 2
     saida = []
     for i, logo in enumerate(logos):
-        x = inicio + i * passo
-        if logo[0] == "si":
-            saida.append(icone(logo[1], x, topo_y, lado))
-        else:
-            saida.append(icone_png(logo[1], x, topo_y, lado))
+        saida.append(desenhar_logo(logo, inicio + i * passo, topo_y, lado))
     return "".join(saida)
 
 
@@ -103,7 +128,8 @@ def texto(conteudo: str, x: float, y: float, tamanho: int, cor: str,
 
 def gerar() -> str:
     n = len(ETAPAS)
-    largura = MARGEM * 2 + n * LARGURA_ETAPA + (n - 1) * ESPACO
+    colunas = n + 1                     # as etapas mais a coluna dos consumidores
+    largura = MARGEM * 2 + colunas * LARGURA_ETAPA + (colunas - 1) * ESPACO
     y_faixa_topo = MARGEM + 8
     altura_faixa = 58
     y_etapas = y_faixa_topo + altura_faixa + 34
@@ -128,7 +154,7 @@ def gerar() -> str:
     partes.append(f'<rect x="{MARGEM}" y="{y_faixa_topo}" width="{largura - 2 * MARGEM}" '
                   f'height="{altura_faixa}" rx="10" fill="{FAIXA}"/>')
     partes.append(texto("ACESSO", MARGEM + 18, y_faixa_topo + 24, 11, TEXTO, "700", "start"))
-    partes.append(texto("Caddy — HTTPS e subdomínios  ·  Supabase — login e sessão",
+    partes.append(texto("Caddy — HTTPS e subdomínios  ·  Supabase — login do painel e token da API",
                         MARGEM + 18, y_faixa_topo + 43, 13, TITULO, "400", "start"))
     partes.append(icone("caddy", largura - MARGEM - 78, y_faixa_topo + 15, 28))
     partes.append(icone("supabase", largura - MARGEM - 40, y_faixa_topo + 15, 28))
@@ -160,6 +186,34 @@ def gerar() -> str:
             ym = y_etapas + ALTURA_ETAPA / 2
             partes.append(f'<line x1="{x1}" y1="{ym}" x2="{x2}" y2="{ym}" '
                           f'stroke="{SETA}" stroke-width="2" marker-end="url(#seta)"/>')
+
+    # ---- coluna dos consumidores: a mesma view, dois publicos --------------
+    x_col = MARGEM + n * (LARGURA_ETAPA + ESPACO)
+    altura_cartao = (ALTURA_ETAPA - 12) / 2
+    centros = []
+    for i, (titulo, sub, logo) in enumerate(CONSUMIDORES):
+        y = y_etapas + i * (altura_cartao + 12)
+        centro_y = y + altura_cartao / 2
+        centros.append(centro_y)
+        partes.append(f'<rect x="{x_col}" y="{y:.1f}" width="{LARGURA_ETAPA}" '
+                      f'height="{altura_cartao:.1f}" rx="12" fill="{CARTAO}" '
+                      f'stroke="{BORDA}" stroke-width="1"/>')
+        partes.append(desenhar_logo(logo, x_col + 12, centro_y - 13, 26))
+        partes.append(texto(titulo, x_col + 46, centro_y - 1, 13, TITULO, "700", "start"))
+        partes.append(texto(sub, x_col + 46, centro_y + 14, 10, TEXTO, "400", "start"))
+
+    # Bifurcacao: o Dremio nao "vira" painel — ele alimenta os dois consumidores.
+    x_fim_dremio = MARGEM + (n - 1) * (LARGURA_ETAPA + ESPACO) + LARGURA_ETAPA
+    x_no = x_fim_dremio + ESPACO / 2
+    ym = y_etapas + ALTURA_ETAPA / 2
+    partes.append(f'<line x1="{x_fim_dremio + 8}" y1="{ym}" x2="{x_no}" y2="{ym}" '
+                  f'stroke="{SETA}" stroke-width="2"/>')
+    partes.append(f'<line x1="{x_no}" y1="{centros[0]:.1f}" x2="{x_no}" y2="{centros[-1]:.1f}" '
+                  f'stroke="{SETA}" stroke-width="2"/>')
+    for centro_y in centros:
+        partes.append(f'<line x1="{x_no}" y1="{centro_y:.1f}" x2="{x_col - 8}" '
+                      f'y2="{centro_y:.1f}" stroke="{SETA}" stroke-width="2" '
+                      f'marker-end="url(#seta)"/>')
 
     # ---- faixa de baixo: quem reexecuta tudo sozinho ----------------------
     partes.append(f'<rect x="{MARGEM}" y="{y_faixa_base}" width="{largura - 2 * MARGEM}" '

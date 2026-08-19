@@ -57,7 +57,13 @@ flowchart LR
 
     SPK[Spark 3.5 + Jupyter<br/>escrita Iceberg]
     DRE[Dremio<br/>SQL federado + reflections]
-    STL[Streamlit<br/>serviço dashboard]
+
+    subgraph Consumo
+        STL[Streamlit<br/>painel SEMARH]
+        API[API de dados<br/>JSON para apps externas]
+    end
+
+    EXT([Aplicação externa])
 
     subgraph Auth
         GT[Supabase GoTrue<br/>login + sessão]
@@ -67,11 +73,13 @@ flowchart LR
     subgraph Automação
         BEAT[celery-beat<br/>todo dia às 7h]
         WRK[celery-worker<br/>refaz o refinamento]
-        RDS[(Redis<br/>fila)]
+        RDS[(Redis<br/>fila + cache da API)]
     end
 
     USR([Navegador]) -->|HTTPS 443| CAD[Caddy<br/>reverse proxy + TLS]
+    EXT -->|HTTPS + X-API-Key| CAD
     CAD -.->|dashboard.| STL
+    CAD -.->|api.| API
     CAD -.->|dremio.| DRE
     CAD -.->|minio.| MIO
     CAD -.->|jupyter.| SPK
@@ -84,11 +92,13 @@ flowchart LR
     DRE --> PG
     DRE --> MG
     STL -->|Arrow Flight :32010| DRE
+    API -->|Arrow Flight :32010| DRE
     STL -->|login / admin| GT
     GT --> SDB
     BEAT --> RDS --> WRK
     WRK -->|reexecuta o notebook| NES
     WRK -.->|carimbo de atualização| STL
+    WRK -.->|carimbo invalida o cache| API
 ```
 
 ### O caminho do dado
@@ -110,8 +120,11 @@ para identificar as ferramentas usadas.</sub>
    o PostgreSQL, o MongoDB e os arquivos soltos do MinIO, tudo na mesma consulta.
 4. **O painel consulta o Dremio por Arrow Flight** (`:32010`), um protocolo binário colunar: o
    resultado chega como Arrow e vira `DataFrame` sem serialização intermediária.
-5. **O usuário acessa só o Caddy** (443), que termina o TLS e roteia por subdomínio para o painel,
-   o Dremio, o MinIO e o Jupyter. Nenhum outro serviço é publicado na rede.
+5. **A API entrega o mesmo dado refinado em JSON** para aplicação de fora. Lê as mesmas views
+   curadas, pelo mesmo Arrow Flight — mas expõe um contrato próprio (um *slug* por conjunto), com
+   autenticação, filtros, paginação e cache. Ver [API de dados refinados](#api-de-dados-refinados).
+6. **O usuário acessa só o Caddy** (443), que termina o TLS e roteia por subdomínio para o painel,
+   a API, o Dremio, o MinIO e o Jupyter. Nenhum outro serviço é publicado na rede.
 
 Em paralelo, o **Celery** refaz os passos 2 e 3 todo dia às 7h, varre o ambiente atrás do que mudou
 e avisa no Telegram — ver [Atualização automática](#atualização-automática-celery).
@@ -126,9 +139,10 @@ e avisa no Telegram — ver [Atualização automática](#atualização-automáti
 | **Nessie** | Catálogo Iceberg com versionamento tipo git | Sabe qual é a versão atual de cada tabela e permite branch/tag: dá para testar uma carga num branch sem afetar quem consulta o `main` |
 | **Dremio** | Query engine federada + camada semântica (spaces/views) | Junta lakehouse, PostgreSQL e MongoDB numa consulta só, sem copiar dado, e serve o resultado por Arrow Flight |
 | **Streamlit** | O painel que o usuário final abre | Interface em Python puro: quem escreve o notebook escreve a tela, sem stack de frontend |
+| **API de dados** | Serve as views curadas em JSON, para aplicações de fora | Dá ao lakehouse um contrato público estável: a view pode ser renomeada ou trocada de fonte sem quebrar o app de terceiro |
 | **Caddy** | Proxy reverso com TLS automático | Único serviço exposto: emite os certificados sozinho (CA interna) e mantém o resto fora da rede |
 | **Supabase GoTrue** | Login do painel (usuários, sessões, tokens) | Autenticação pronta e testada, com banco próprio — o painel não guarda senha |
-| **Celery + Redis** | Agenda e executa a carga diária; Redis é a fila | Tira o "alguém precisa rodar o notebook" do processo, e dá histórico do que rodou |
+| **Celery + Redis** | Agenda e executa a carga diária; o Redis é a fila e, no banco 1, o cache da API | Tira o "alguém precisa rodar o notebook" do processo, e dá histórico do que rodou |
 | **PostgreSQL / MongoDB** | Bancos de origem de exemplo | Representam os sistemas que já existem na casa e viram fonte federada no Dremio |
 
 ### Os 14 serviços
@@ -144,7 +158,7 @@ e avisa no Telegram — ver [Atualização automática](#atualização-automáti
 | `nessie` | Catálogo Iceberg versionado | loopback |
 | `postgres` · `mongo` | Bancos de origem | loopback |
 | `supabase-auth` · `supabase-db` | Login do painel (GoTrue + banco próprio) | loopback |
-| `redis` | Fila do Celery | rede interna |
+| `redis` | Fila do Celery e cache da API | rede interna |
 | `celery-beat` · `celery-worker` | Agenda e executa a atualização diária | rede interna |
 
 Os serviços ficam numa rede Docker chamada `interna` (que o Compose publica como
@@ -567,9 +581,12 @@ e no que o painel exibe. Os serviços sobem com o `docker compose up -d`; não h
 
 | Serviço | Papel |
 |---|---|
-| `redis` | Fila do Celery (broker + resultados). Efêmero: sem RDB nem AOF |
+| `redis` | Fila do Celery (broker + resultados), no banco 0. Efêmero: sem RDB nem AOF |
 | `celery-beat` | Agendador — publica a tarefa às 07:00 |
 | `celery-worker` | Executa a tarefa. Usa a **mesma imagem do Spark**, porque sobe um driver Spark |
+
+> O mesmo Redis guarda, no **banco 1**, o cache de resposta da API — e o carimbo que esta carga
+> grava é o que invalida esse cache. Ver [API de dados refinados](#api-de-dados-refinados).
 
 Tudo que um BI tem — arquivos de origem, notebook, tabelas e a pasta das views — é declarado num
 item da lista `EDICOES`, em [`celery_app/tarefas.py`](celery_app/tarefas.py). **Acrescentar um BI é
@@ -1660,8 +1677,8 @@ Ambiente de referência: Docker 29.6.1, Compose v5.3.0, kernel Linux 7.0, x86_64
 
 | Verificação | Resultado |
 |---|---|
-| 9 serviços `running` (com o proxy Caddy); MinIO, Postgres, `supabase-db` e `supabase-auth` `healthy` | ✅ |
-| Proxy TLS: `https://{dashboard,dremio,minio,jupyter}.localhost` → 200; HTTP → 308 p/ HTTPS | ✅ |
+| 14 serviços `running` (com o proxy Caddy); MinIO, Postgres, `supabase-db`, `supabase-auth`, `dashboard` e `api` `healthy` | ✅ |
+| Proxy TLS: `https://{dashboard,api,dremio,minio,jupyter}.localhost` → 200; HTTP → 308 p/ HTTPS | ✅ |
 | Rede externa só vê o proxy (443/80); portas de dados fechadas fora de `127.0.0.1` | ✅ |
 | MinIO: 3 zonas criadas a partir do `.env`, seed copiado, objetos sobrevivem a `down` + `up` | ✅ |
 | Nessie 0.108.4: `/api/v2/config` com `maxSupportedApiVersion: 2`; repositório sobrevive a restart | ✅ |
@@ -1693,6 +1710,13 @@ Ambiente de referência: Docker 29.6.1, Compose v5.3.0, kernel Linux 7.0, x86_64
 | 26 bibliotecas de DS/ML importam; `tensorflow` sem o erro de protobuf da base | ✅ |
 | Namespace do Nessie gera o prefixo correspondente dentro do armazém | ✅ |
 | Troca do `PROJETO` preservando fontes, spaces e dados (migração de volumes) | ✅ |
+| API: os **10 conjuntos** do `refinamento` respondendo com dado real; totais conferem com o Dremio (224 / 672 / 5 / 11 por edição, 397 ações, 224 municípios) | ✅ |
+| API: chave do `.env` e JWT real do GoTrue aceitos (`/v1/identidade`); token adulterado e requisição sem credencial → 401 | ✅ |
+| API: limite por minuto — 120 requisições passam, as seguintes recebem 429; contagem separada por identidade no Redis | ✅ |
+| API: cache no Redis com invalidação pelo carimbo da carga — 146 ms na 1ª chamada, 8,7 ms na 2ª | ✅ |
+| API: filtro com aspa simples e `; DROP TABLE` vira literal escapado (0 linhas, sem erro); parâmetro de tipo errado → 400 antes de tocar a fonte | ✅ |
+| API: `/docs` com o botão *Authorize* e uma seção por conjunto; `/openapi.json` válido | ✅ |
+| API: 151 testes passando sem a stack de pé (Dremio dublado por um motor falso) | ✅ |
 
 ---
 
